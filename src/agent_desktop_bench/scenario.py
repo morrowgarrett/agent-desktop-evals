@@ -65,7 +65,7 @@ class Scenario(BaseModel):
             title=parsed.title,
             target_app=parsed.target_app,
             timeout_seconds=parsed.timeout_seconds,
-            prompt=prompt_path.read_text(),
+            prompt=prompt_path.read_text(encoding="utf-8"),
             check_script=check_script,
             expect_exit_code=parsed.check.expect_exit_code,
         )
