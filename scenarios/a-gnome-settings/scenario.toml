@@ -1,0 +1,8 @@
+id = "a-gnome-settings"
+title = "GNOME Settings: change Background to a different solid color"
+target_app = "gnome-control-center"
+timeout_seconds = 180
+
+[check]
+script = "check_state.sh"
+expect_exit_code = 0
