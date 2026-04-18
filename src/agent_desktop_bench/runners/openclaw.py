@@ -27,7 +27,7 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
         except json.JSONDecodeError:
             continue
         if event.get("event") == "turn_complete":
-            tokens += int(event.get("input_tokens", 0)) + int(event.get("output_tokens", 0))
+            tokens += int(event.get("input_tokens") or 0) + int(event.get("output_tokens") or 0)
         if event.get("event") == "tool_call" and event.get("tool") == "screenshot":
             screenshots += 1
     return {"tokens": tokens, "screenshots": screenshots}
@@ -69,7 +69,9 @@ class OpenClawRunner:
         wallclock_s = time.monotonic() - t0
         metrics = _parse_metrics(transcript)
 
-        # Verify success via the scenario's check script
+        # Verify success via the scenario's check script.
+        # check_state inherits the parent env unmodified — even in BASELINE mode,
+        # the *check* must have full PATH (gsettings, dconf, etc.).
         check = subprocess.run(
             ["bash", str(scenario.check_script)],
             capture_output=True, text=True,
