@@ -1,7 +1,7 @@
 [project]
-name = "agent-desktop-bench"
+name = "agent-desktop-evals"
 version = "0.1.0"
-description = "Reproducible benchmark for AI agents controlling Linux desktops via agent-desktop (a11y-first) vs vision baseline."
+description = "Reproducible evals for agent-desktop: paired-baseline benchmark for AI agents controlling Linux desktops with vs without an a11y-first CLI."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
@@ -20,14 +20,14 @@ dev = [
 ]
 
 [project.scripts]
-bench = "agent_desktop_bench.cli:main"
+bench = "agent_desktop_evals.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/agent_desktop_bench"]
+packages = ["src/agent_desktop_evals"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

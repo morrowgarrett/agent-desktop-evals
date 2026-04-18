@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from agent_desktop_bench.runner_base import Mode, RunResult
-from agent_desktop_bench.runners.stub import StubRunner
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.runner_base import Mode, RunResult
+from agent_desktop_evals.runners.stub import StubRunner
+from agent_desktop_evals.scenario import Scenario
 
 
 def test_stub_runner_returns_canned_success(scenario_dir: Path):

@@ -1,6 +1,6 @@
-# agent-desktop-bench
+# agent-desktop-evals
 
-Reproducible benchmark comparing AI agents controlling Linux native desktop applications **with** vs. **without** the [`agent-desktop`](https://github.com/crowecawcaw/agent-desktop) accessibility-first CLI.
+Reproducible **evals** for [`agent-desktop`](https://github.com/crowecawcaw/agent-desktop): a paired-baseline benchmark that scores AI agents controlling Linux native desktop apps **with** vs **without** the a11y-first CLI.
 
 **Status:** M1 — scenario A (GNOME Settings) only. Multi-scenario, multi-DE, and multi-agent expansion lands in subsequent milestones.
 

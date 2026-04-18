@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from agent_desktop_bench.runner_base import Mode, RunResult, now_iso
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
+from agent_desktop_evals.scenario import Scenario
 
 
 class StubRunner:

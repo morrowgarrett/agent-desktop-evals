@@ -1,4 +1,4 @@
-from agent_desktop_bench.env import detect_display_server, has_agent_desktop_on_path
+from agent_desktop_evals.env import detect_display_server, has_agent_desktop_on_path
 
 
 def test_detect_display_server_prefers_xdg_session_type(monkeypatch):

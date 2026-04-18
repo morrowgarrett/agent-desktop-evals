@@ -4,9 +4,9 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from agent_desktop_bench.runner_base import Mode
-from agent_desktop_bench.runners.openclaw import OpenClawRunner, _parse_metrics
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.runner_base import Mode
+from agent_desktop_evals.runners.openclaw import OpenClawRunner, _parse_metrics
+from agent_desktop_evals.scenario import Scenario
 
 # --- _parse_metrics tests ---
 
@@ -75,7 +75,7 @@ def _agent_mock(stdout: str = "", returncode: int = 0, stderr: str = "") -> Magi
     return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
-@patch("agent_desktop_bench.runners.openclaw.subprocess.run")
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path):
     """Agent succeeds AND check_state passes → success=True."""
     agent = _agent_mock(
@@ -98,7 +98,7 @@ def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path):
     assert check_call_args[1] == str(scenario.check_script)
 
 
-@patch("agent_desktop_bench.runners.openclaw.subprocess.run")
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_check_failure_means_success_false(mock_run, scenario_dir: Path):
     """Agent succeeds but check_state returns non-expected exit → success=False."""
     agent = _agent_mock(
@@ -114,7 +114,7 @@ def test_openclaw_runner_check_failure_means_success_false(mock_run, scenario_di
     assert result.tokens == 60
 
 
-@patch("agent_desktop_bench.runners.openclaw.subprocess.run")
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_baseline_strips_agent_desktop_from_path(
     mock_run, scenario_dir: Path, tmp_path: Path, monkeypatch
 ):
@@ -138,7 +138,7 @@ def test_openclaw_runner_baseline_strips_agent_desktop_from_path(
     assert str(no_ad) in agent_env["PATH"]
 
 
-@patch("agent_desktop_bench.runners.openclaw.subprocess.run")
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_augmented_keeps_path_intact(
     mock_run, scenario_dir: Path, tmp_path: Path, monkeypatch
 ):
@@ -157,7 +157,7 @@ def test_openclaw_runner_augmented_keeps_path_intact(
     assert str(has_ad) in agent_env["PATH"]
 
 
-@patch("agent_desktop_bench.runners.openclaw.subprocess.run")
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_timeout_returns_failure_result(mock_run, scenario_dir: Path):
     """subprocess.TimeoutExpired → RunResult with success=False, error mentions timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="openclaw", timeout=30)

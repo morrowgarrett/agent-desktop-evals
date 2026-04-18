@@ -1,5 +1,5 @@
-from agent_desktop_bench.report import render_csv, render_markdown
-from agent_desktop_bench.runner_base import Mode, RunResult
+from agent_desktop_evals.report import render_csv, render_markdown
+from agent_desktop_evals.runner_base import Mode, RunResult
 
 
 def _result(scenario="a-gnome-settings", runner="openclaw", mode=Mode.BASELINE,

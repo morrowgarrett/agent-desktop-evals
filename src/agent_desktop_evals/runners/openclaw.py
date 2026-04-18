@@ -6,8 +6,8 @@ import subprocess
 import time
 from pathlib import Path
 
-from agent_desktop_bench.runner_base import Mode, RunResult, now_iso
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
+from agent_desktop_evals.scenario import Scenario
 
 
 def _parse_metrics(transcript: str) -> dict[str, int]:

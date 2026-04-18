@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_desktop_bench.scenario import Scenario, ScenarioError
+from agent_desktop_evals.scenario import Scenario, ScenarioError
 
 
 def test_load_minimal_scenario(scenario_dir: Path):

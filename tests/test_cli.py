@@ -2,7 +2,7 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from agent_desktop_bench.cli import main
+from agent_desktop_evals.cli import main
 
 
 def test_cli_help():

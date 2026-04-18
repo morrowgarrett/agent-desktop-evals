@@ -4,11 +4,11 @@ from pathlib import Path
 
 import click
 
-from agent_desktop_bench.report import render_csv, render_markdown
-from agent_desktop_bench.runner_base import Mode, RunResult
-from agent_desktop_bench.runners.openclaw import OpenClawRunner
-from agent_desktop_bench.runners.stub import StubRunner
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.report import render_csv, render_markdown
+from agent_desktop_evals.runner_base import Mode, RunResult
+from agent_desktop_evals.runners.openclaw import OpenClawRunner
+from agent_desktop_evals.runners.stub import StubRunner
+from agent_desktop_evals.scenario import Scenario
 
 
 def _build_runner(name: str):
@@ -21,7 +21,7 @@ def _build_runner(name: str):
 
 @click.group()
 def main() -> None:
-    """agent-desktop-bench: paired-baseline benchmark for AI agents on Linux desktops."""
+    """agent-desktop-evals: paired-baseline benchmark for AI agents on Linux desktops."""
 
 
 @main.command()

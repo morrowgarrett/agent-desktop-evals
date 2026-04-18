@@ -6,7 +6,7 @@ from typing import Protocol
 
 from pydantic import BaseModel
 
-from agent_desktop_bench.scenario import Scenario
+from agent_desktop_evals.scenario import Scenario
 
 
 class Mode(str, Enum):  # noqa: UP042  # spec uses (str, Enum); equivalent to StrEnum on 3.12

@@ -4,7 +4,7 @@ import csv
 import io
 from collections import defaultdict
 
-from agent_desktop_bench.runner_base import Mode, RunResult
+from agent_desktop_evals.runner_base import Mode, RunResult
 
 
 def render_markdown(results: list[RunResult]) -> str:
