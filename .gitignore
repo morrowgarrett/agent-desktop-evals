@@ -10,3 +10,6 @@ reports/raw/
 reports/*.tmp
 .coverage
 htmlcov/
+.env
+.env.*
+*.env

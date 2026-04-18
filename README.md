@@ -6,10 +6,17 @@ Reproducible benchmark comparing AI agents controlling Linux native desktop appl
 
 **Headline metrics:** success, wall-clock seconds, tokens consumed, screenshots sent, steps taken.
 
-## Quick start
+## Verify the dev env
 
 ```bash
-uv sync
+uv sync --all-extras
+uv run pytest    # currently exits 5 (no tests yet — Tasks 2-7 add them)
+```
+
+## Quick start (after M1 lands)
+
+```bash
+uv sync --all-extras
 uv run bench run a-gnome-settings --runner openclaw --mode baseline
 uv run bench run a-gnome-settings --runner openclaw --mode augmented
 ```
