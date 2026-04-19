@@ -1,16 +1,26 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, NonNegativeInt, ValidationError
 
 from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
 from agent_desktop_evals.scenario import Scenario
+
+# Sentinel distinguishing "use the default transcript_dir" from "explicitly
+# disable persistence (None)". Using a sentinel keeps the public default
+# discoverable in the signature while preserving back-compat for callers that
+# pass transcript_dir=None to opt out (e.g., tests that don't want disk side
+# effects).
+_DEFAULT_TRANSCRIPT_DIR = object()
 
 
 class _Usage(BaseModel):
@@ -165,10 +175,111 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
     return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
 
+def _coerce_text(value: object) -> str:
+    """Coerce subprocess output (str | bytes | None) to a str for transcript dump.
+
+    text=True normally yields str, but TimeoutExpired.stdout/.stderr can return
+    bytes if the timeout fires before stream decoding completes. Replace bad
+    bytes rather than raise — the transcript is best-effort audit data.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _format_timestamp(started_at_iso: str) -> str:
+    """Reformat an ISO 8601 timestamp as YYYYMMDD-HHMMSS for path inclusion.
+
+    Tolerates both '+00:00' and 'Z' suffixes. Falls back to a naive parse if
+    fromisoformat can't handle the input (e.g., a future ISO variant).
+    """
+    s = started_at_iso
+    # Python <3.11's fromisoformat won't accept the trailing 'Z'; normalize it.
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        # Last-resort: strip subsecond / timezone and try a basic parse.
+        dt = datetime.utcnow()
+    return dt.strftime("%Y%m%d-%H%M%S")
+
+
+def _write_transcript(
+    *,
+    base_dir: Path,
+    scenario_id: str,
+    runner_name: str,
+    mode: Mode,
+    agent_id: str,
+    started_at_iso: str,
+    returncode: int,
+    parse_warnings: int,
+    argv: list[str],
+    stderr: str,
+    stdout: str,
+) -> str:
+    """Write the structured transcript to disk and return the absolute path.
+
+    Layout: <base_dir>/<scenario_id>/<mode>/<YYYYMMDD-HHMMSS>-<8-hex-hash>.txt
+
+    The hash is md5 over the full content (NOT for security — collision
+    avoidance + a deduplication signal for identical reruns). Use
+    usedforsecurity=False where supported to satisfy stricter linters /
+    FIPS-restricted environments.
+    """
+    ts = _format_timestamp(started_at_iso)
+    # Stderr-then-stdout matches the existing parser concatenation order
+    # (proc.stdout + proc.stderr) inverted — but the order chosen here
+    # ("stderr then stdout") puts the upstream banner before the JSON in the
+    # human-readable dump, which matches how operators read real captures.
+    # (The parser is independent of this ordering since it scans for `{`.)
+    argv_block = "\n".join(shlex.quote(str(a)) for a in argv)
+    body_sections = (
+        "=== meta ===\n"
+        f"scenario_id: {scenario_id}\n"
+        f"runner: {runner_name}\n"
+        f"mode: {mode.value}\n"
+        f"agent_id: {agent_id}\n"
+        f"started_at: {started_at_iso}\n"
+        f"returncode: {returncode}\n"
+        f"parse_warnings: {parse_warnings}\n"
+        "=== argv ===\n"
+        f"{argv_block}\n"
+        "=== stderr ===\n"
+        f"{stderr}\n"
+        "=== stdout ===\n"
+        f"{stdout}\n"
+    )
+    # Hash the content so identical reruns produce identical filenames (a
+    # deduplication signal for the operator). md5 is fine here — not security.
+    try:
+        digest = hashlib.md5(
+            body_sections.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
+    except TypeError:
+        # Older Python versions don't accept usedforsecurity; fall through.
+        digest = hashlib.md5(body_sections.encode("utf-8")).hexdigest()
+    short_hash = digest[:8]
+
+    target_dir = (base_dir / scenario_id / mode.value).resolve()
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / f"{ts}-{short_hash}.txt"
+    target.write_text(body_sections, encoding="utf-8")
+    return str(target)
+
+
 class OpenClawRunner:
     name = "openclaw"
 
-    def __init__(self, openclaw_bin: str = "openclaw", agent_id: str = "main"):
+    def __init__(
+        self,
+        openclaw_bin: str = "openclaw",
+        agent_id: str = "main",
+        transcript_dir: Path | str | None | object = _DEFAULT_TRANSCRIPT_DIR,
+    ):
         # Resolve to an absolute path at init time. This way, BASELINE-mode
         # PATH-stripping (which removes dirs containing agent-desktop) doesn't
         # also break openclaw when both binaries live in the same directory.
@@ -182,17 +293,39 @@ class OpenClawRunner:
         # OpenClaw 2026.4.9 requires --agent / --to / --session-id; "main" is
         # the user's default agent id and matches typical local installs.
         self._agent_id = agent_id
+        # Sentinel resolution: _DEFAULT_TRANSCRIPT_DIR ⇒ Path("reports/raw")
+        # resolved against CWD at run-time (NOT init-time, so monkeypatched
+        # cwd in tests behaves as expected). Explicit None disables.
+        if transcript_dir is _DEFAULT_TRANSCRIPT_DIR:
+            self._transcript_dir: Path | None = Path("reports/raw")
+        elif transcript_dir is None:
+            self._transcript_dir = None
+        else:
+            self._transcript_dir = Path(transcript_dir)  # type: ignore[arg-type]
 
     def run(self, scenario: Scenario, mode: Mode) -> RunResult:
         started = now_iso()
         t0 = time.monotonic()
 
+        # Pre-build the spawn argv even on the missing-binary path, so the
+        # transcript can record what we *would* have invoked. This keeps the
+        # failure-path transcript informative for post-facto auditing.
+        argv = [
+            self._bin or self._requested_bin, "agent",
+            "--agent", self._agent_id,
+            "--local",
+            "--message", scenario.prompt,
+            "--json",
+        ]
+
         if self._bin is None:
-            return RunResult(
-                scenario_id=scenario.id, runner_name=self.name, mode=mode,
-                success=False, tokens=0, screenshots=0,
-                wallclock_s=time.monotonic() - t0, started_at_iso=started,
-                error=f"failed to spawn {self._requested_bin}: not found on PATH",
+            error = f"failed to spawn {self._requested_bin}: not found on PATH"
+            return self._finalize(
+                scenario=scenario, mode=mode, started=started,
+                wallclock_s=time.monotonic() - t0,
+                argv=argv, stderr=error, stdout="",
+                returncode=-1, success=False, error=error,
+                tokens=0, screenshots=0, parse_warnings=0,
             )
 
         env = os.environ.copy()
@@ -202,13 +335,7 @@ class OpenClawRunner:
 
         try:
             proc = subprocess.run(
-                [
-                    self._bin, "agent",
-                    "--agent", self._agent_id,
-                    "--local",
-                    "--message", scenario.prompt,
-                    "--json",
-                ],
+                argv,
                 env=env,
                 capture_output=True,
                 text=True,
@@ -224,22 +351,31 @@ class OpenClawRunner:
             # OpenClaw ever shifts which stream it emits on.
             transcript = (proc.stdout or "") + (proc.stderr or "")
             error = proc.stderr if proc.returncode != 0 else None
-        except subprocess.TimeoutExpired:
-            return RunResult(
-                scenario_id=scenario.id, runner_name=self.name, mode=mode,
-                success=False, tokens=0, screenshots=0,
-                wallclock_s=time.monotonic() - t0, started_at_iso=started,
-                error=f"timeout after {scenario.timeout_seconds}s",
+        except subprocess.TimeoutExpired as te:
+            err_msg = f"timeout after {scenario.timeout_seconds}s"
+            # te.stdout / te.stderr may be bytes or None (text=True surfaces
+            # str when present, but the timeout path can return bytes). Coerce
+            # defensively for the transcript dump.
+            partial_stdout = _coerce_text(te.stdout)
+            partial_stderr = _coerce_text(te.stderr)
+            return self._finalize(
+                scenario=scenario, mode=mode, started=started,
+                wallclock_s=time.monotonic() - t0,
+                argv=argv, stderr=partial_stderr or err_msg, stdout=partial_stdout,
+                returncode=-1, success=False, error=err_msg,
+                tokens=0, screenshots=0, parse_warnings=0,
             )
         except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError) as e:
             # UnicodeDecodeError is defensive belt-and-suspenders: errors='replace'
             # above should prevent it, but if a future code path uses errors='strict'
             # we don't want to crash the runner mid-eval.
-            return RunResult(
-                scenario_id=scenario.id, runner_name=self.name, mode=mode,
-                success=False, tokens=0, screenshots=0,
-                wallclock_s=time.monotonic() - t0, started_at_iso=started,
-                error=f"failed to spawn {self._bin}: {e}",
+            err_msg = f"failed to spawn {self._bin}: {e}"
+            return self._finalize(
+                scenario=scenario, mode=mode, started=started,
+                wallclock_s=time.monotonic() - t0,
+                argv=argv, stderr=err_msg, stdout="",
+                returncode=-1, success=False, error=err_msg,
+                tokens=0, screenshots=0, parse_warnings=0,
             )
 
         wallclock_s = time.monotonic() - t0
@@ -251,12 +387,13 @@ class OpenClawRunner:
         # crashed or exited with an error.
         if proc.returncode != 0:
             stderr_msg = proc.stderr.strip()[:500] if proc.stderr else "<no stderr>"
-            return RunResult(
-                scenario_id=scenario.id, runner_name=self.name, mode=mode,
-                success=False,
-                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
-                wallclock_s=wallclock_s, started_at_iso=started,
+            return self._finalize(
+                scenario=scenario, mode=mode, started=started,
+                wallclock_s=wallclock_s, argv=argv,
+                stderr=proc.stderr or "", stdout=proc.stdout or "",
+                returncode=proc.returncode, success=False,
                 error=f"agent exited {proc.returncode}: {stderr_msg}",
+                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
             )
 
@@ -271,27 +408,84 @@ class OpenClawRunner:
                 timeout=scenario.check_timeout_seconds,
             )
         except subprocess.TimeoutExpired:
-            return RunResult(
-                scenario_id=scenario.id, runner_name=self.name, mode=mode,
-                success=False,
-                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
-                wallclock_s=wallclock_s, started_at_iso=started,
+            return self._finalize(
+                scenario=scenario, mode=mode, started=started,
+                wallclock_s=wallclock_s, argv=argv,
+                stderr=proc.stderr or "", stdout=proc.stdout or "",
+                returncode=proc.returncode, success=False,
                 error=f"check_state timed out after {scenario.check_timeout_seconds}s",
+                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
             )
         success = check.returncode == scenario.expect_exit_code
+
+        return self._finalize(
+            scenario=scenario, mode=mode, started=started,
+            wallclock_s=wallclock_s, argv=argv,
+            stderr=proc.stderr or "", stdout=proc.stdout or "",
+            returncode=proc.returncode, success=success, error=error,
+            tokens=metrics["tokens"], screenshots=metrics["screenshots"],
+            parse_warnings=metrics["parse_warnings"],
+        )
+
+    def _finalize(
+        self,
+        *,
+        scenario: Scenario,
+        mode: Mode,
+        started: str,
+        wallclock_s: float,
+        argv: list[str],
+        stderr: str,
+        stdout: str,
+        returncode: int,
+        success: bool,
+        error: str | None,
+        tokens: int,
+        screenshots: int,
+        parse_warnings: int,
+    ) -> RunResult:
+        """Build a RunResult, persisting the transcript first when enabled.
+
+        Centralizing the return path here ensures every code path (success,
+        agent-failure, timeout, spawn-error, check-timeout) gets a transcript
+        written when persistence is enabled. Transcripts on failure paths are
+        the most valuable data for post-facto investigation.
+        """
+        transcript_path: str | None = None
+        if self._transcript_dir is not None:
+            try:
+                transcript_path = _write_transcript(
+                    base_dir=self._transcript_dir,
+                    scenario_id=scenario.id,
+                    runner_name=self.name,
+                    mode=mode,
+                    agent_id=self._agent_id,
+                    started_at_iso=started,
+                    returncode=returncode,
+                    parse_warnings=parse_warnings,
+                    argv=argv,
+                    stderr=stderr,
+                    stdout=stdout,
+                )
+            except OSError:
+                # Persistence must never mask a real result. If disk-write
+                # fails (full FS, permissions), fall back to None so the
+                # caller still receives the metrics; the operator can retry.
+                transcript_path = None
 
         return RunResult(
             scenario_id=scenario.id,
             runner_name=self.name,
             mode=mode,
             success=success,
-            tokens=metrics["tokens"],
-            screenshots=metrics["screenshots"],
+            tokens=tokens,
+            screenshots=screenshots,
             wallclock_s=wallclock_s,
             started_at_iso=started,
             error=error,
-            parse_warnings=metrics["parse_warnings"],
+            parse_warnings=parse_warnings,
+            transcript_path=transcript_path,
         )
 
     @staticmethod

@@ -15,6 +15,19 @@ from agent_desktop_evals.scenario import Scenario
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
 SMOKE_FIXTURE = FIXTURE_DIR / "openclaw-smoke-output.txt"
 
+
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Auto-chdir each test to its tmp_path so OpenClawRunner's default
+    transcript-persistence path (./reports/raw/) writes inside the test sandbox
+    instead of polluting the real repo's reports/raw/ directory.
+
+    Tests that pass an explicit absolute transcript_dir or transcript_dir=None
+    are unaffected. Tests that require a specific cwd should call
+    monkeypatch.chdir themselves AFTER this fixture runs.
+    """
+    monkeypatch.chdir(tmp_path)
+
 # --- _parse_metrics tests ---
 
 
@@ -643,6 +656,183 @@ def test_openclaw_runner_uses_errors_replace_for_subprocess_decoding(
         assert call.kwargs.get("errors") == "replace", (
             f"subprocess.run called without errors='replace': {call.kwargs!r}"
         )
+
+
+# --- Transcript persistence tests ---
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_persists_transcript_to_disk(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """When transcript_dir is set, raw stderr+stdout written to a path on disk."""
+    transcript_dir = tmp_path / "raw"
+    runner = OpenClawRunner(transcript_dir=transcript_dir)
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="agent stdout content", stderr="agent stderr content"),
+        MagicMock(returncode=0, stdout="check stdout", stderr=""),
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.transcript_path is not None
+    p = Path(result.transcript_path)
+    assert p.is_absolute(), f"transcript_path must be absolute, got {result.transcript_path!r}"
+    assert p.exists()
+    content = p.read_text()
+    assert "agent stderr content" in content
+    assert "agent stdout content" in content
+    assert "scenario_id: minimal-scenario" in content
+    assert "mode: augmented" in content
+    assert "returncode: 0" in content
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_writes_to_default_path_when_none_given(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path, monkeypatch
+):
+    """Default transcript_dir is reports/raw relative to CWD."""
+    monkeypatch.chdir(tmp_path)
+    runner = OpenClawRunner()  # no transcript_dir → default
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="x", stderr="y"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.BASELINE)
+
+    expected_root = (tmp_path / "reports" / "raw").resolve()
+    assert expected_root.exists()
+    assert result.transcript_path is not None
+    assert Path(result.transcript_path).resolve().is_relative_to(expected_root)
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_skips_persistence_when_transcript_dir_explicitly_none(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path, monkeypatch
+):
+    """Passing transcript_dir=None explicitly disables persistence (for tests etc)."""
+    monkeypatch.chdir(tmp_path)  # ensure we don't accidentally write to real cwd
+    runner = OpenClawRunner(transcript_dir=None)
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="x", stderr="y"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.transcript_path is None
+    # And no reports/raw directory should have been created in cwd.
+    assert not (tmp_path / "reports" / "raw").exists()
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_transcript_path_format(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """Path follows reports/raw/<scenario>/<mode>/<timestamp>-<hash>.txt."""
+    runner = OpenClawRunner(transcript_dir=tmp_path / "raw")
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="x", stderr="y"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.BASELINE)
+
+    assert result.transcript_path is not None
+    p = Path(result.transcript_path)
+    assert p.parent == (tmp_path / "raw" / scenario.id / "baseline").resolve()
+    assert p.suffix == ".txt"
+    import re
+    assert re.match(r"^\d{8}-\d{6}-[0-9a-f]{8}\.txt$", p.name), (
+        f"filename must match YYYYMMDD-HHMMSS-XXXXXXXX.txt, got {p.name!r}"
+    )
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_persists_transcript_on_agent_failure(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """Nonzero agent exit must still produce a transcript — that's when audit data matters most."""
+    runner = OpenClawRunner(transcript_dir=tmp_path / "raw")
+    mock_run.side_effect = [
+        MagicMock(returncode=2, stdout="partial stdout", stderr="agent crashed: bad flag"),
+        MagicMock(returncode=0),  # check (won't be reached, but harmless)
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.success is False
+    assert result.transcript_path is not None
+    content = Path(result.transcript_path).read_text()
+    assert "agent crashed: bad flag" in content
+    assert "partial stdout" in content
+    assert "returncode: 2" in content
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_persists_transcript_on_timeout(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """Timeout must still write a transcript with whatever metadata is available."""
+    runner = OpenClawRunner(transcript_dir=tmp_path / "raw")
+    mock_run.side_effect = subprocess.TimeoutExpired(cmd="openclaw", timeout=30)
+
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.success is False
+    assert result.transcript_path is not None
+    content = Path(result.transcript_path).read_text()
+    assert "scenario_id: minimal-scenario" in content
+    assert "mode: augmented" in content
+    # The error context should be captured somewhere in the transcript.
+    assert "timeout" in content.lower()
+
+
+def test_openclaw_runner_persists_transcript_on_spawn_failure(
+    scenario_dir: Path, tmp_path: Path
+):
+    """Missing binary path must still write a transcript so failures are auditable."""
+    runner = OpenClawRunner(
+        openclaw_bin="/nonexistent/path/openclaw",
+        transcript_dir=tmp_path / "raw",
+    )
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.success is False
+    assert result.transcript_path is not None
+    content = Path(result.transcript_path).read_text()
+    assert "scenario_id: minimal-scenario" in content
+    assert "failed to spawn" in content.lower()
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_transcript_includes_argv_and_meta_sections(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """Transcript file must include the documented section markers and argv."""
+    runner = OpenClawRunner(transcript_dir=tmp_path / "raw")
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="OUT", stderr="ERR"),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    scenario = Scenario.load(scenario_dir)
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    content = Path(result.transcript_path).read_text()
+    assert "=== meta ===" in content
+    assert "=== argv ===" in content
+    assert "=== stderr ===" in content
+    assert "=== stdout ===" in content
+    # argv should mention the agent subcommand and --json flag we always pass.
+    assert "agent" in content
+    assert "--json" in content
+    # parse_warnings must appear in the meta block (count is 0 here since
+    # the mocked stdout/stderr contain no JSON or `{`).
+    assert "parse_warnings:" in content
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell-out")
