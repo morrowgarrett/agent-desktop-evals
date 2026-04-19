@@ -65,6 +65,13 @@ class OpenClawRunner:
                 wallclock_s=time.monotonic() - t0, started_at_iso=started,
                 error=f"timeout after {scenario.timeout_seconds}s",
             )
+        except (FileNotFoundError, PermissionError, OSError) as e:
+            return RunResult(
+                scenario_id=scenario.id, runner_name=self.name, mode=mode,
+                success=False, tokens=0, screenshots=0,
+                wallclock_s=time.monotonic() - t0, started_at_iso=started,
+                error=f"failed to spawn {self._bin}: {e}",
+            )
 
         wallclock_s = time.monotonic() - t0
         metrics = _parse_metrics(transcript)
@@ -72,10 +79,20 @@ class OpenClawRunner:
         # Verify success via the scenario's check script.
         # check_state inherits the parent env unmodified — even in BASELINE mode,
         # the *check* must have full PATH (gsettings, dconf, etc.).
-        check = subprocess.run(
-            ["bash", str(scenario.check_script)],
-            capture_output=True, text=True,
-        )
+        try:
+            check = subprocess.run(
+                ["bash", str(scenario.check_script)],
+                capture_output=True, text=True,
+                timeout=scenario.check_timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            return RunResult(
+                scenario_id=scenario.id, runner_name=self.name, mode=mode,
+                success=False,
+                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
+                wallclock_s=wallclock_s, started_at_iso=started,
+                error=f"check_state timed out after {scenario.check_timeout_seconds}s",
+            )
         success = check.returncode == scenario.expect_exit_code
 
         return RunResult(

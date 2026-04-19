@@ -176,3 +176,33 @@ def test_openclaw_runner_timeout_returns_failure_result(mock_run, scenario_dir: 
     assert result.screenshots == 0
     assert result.error is not None
     assert "timeout" in result.error.lower()
+
+
+def test_openclaw_runner_handles_missing_binary(scenario_dir: Path):
+    """If the openclaw binary doesn't exist, return a failure RunResult, not raise."""
+    scenario = Scenario.load(scenario_dir)
+    result = OpenClawRunner(openclaw_bin="/nonexistent/path/openclaw").run(
+        scenario, mode=Mode.AUGMENTED
+    )
+    assert result.success is False
+    assert result.error is not None
+    assert "failed to spawn" in result.error.lower()
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path):
+    """If the check_state subprocess times out, surface error mentioning check_state timeout."""
+    agent = _agent_mock(
+        stdout='{"event": "turn_complete", "input_tokens": 100, "output_tokens": 50}'
+    )
+    mock_run.side_effect = [
+        agent,
+        subprocess.TimeoutExpired(cmd="bash", timeout=30),
+    ]
+
+    scenario = Scenario.load(scenario_dir)
+    result = OpenClawRunner().run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.success is False
+    assert result.error is not None
+    assert "check_state timed out" in result.error.lower()

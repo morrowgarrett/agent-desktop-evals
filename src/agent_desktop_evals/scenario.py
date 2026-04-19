@@ -13,6 +13,7 @@ class ScenarioError(ValueError):
 class _Check(BaseModel):
     script: str
     expect_exit_code: int = 0
+    timeout_seconds: int = Field(default=30, gt=0)
 
 
 class _ScenarioToml(BaseModel):
@@ -31,6 +32,7 @@ class Scenario(BaseModel):
     prompt: str
     check_script: Path
     expect_exit_code: int
+    check_timeout_seconds: int
 
     @classmethod
     def load(cls, directory: Path) -> Scenario:
@@ -88,4 +90,5 @@ class Scenario(BaseModel):
             prompt=prompt_path.read_text(encoding="utf-8"),
             check_script=check_script,
             expect_exit_code=parsed.check.expect_exit_code,
+            check_timeout_seconds=parsed.check.timeout_seconds,
         )
