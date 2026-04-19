@@ -78,7 +78,7 @@ def _agent_mock(stdout: str = "", returncode: int = 0, stderr: str = "") -> Magi
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path):
+def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """Agent succeeds AND check_state passes → success=True."""
     agent = _agent_mock(
         stdout='{"event": "turn_complete", "input_tokens": 500, "output_tokens": 100}\n'
@@ -101,7 +101,9 @@ def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path):
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_check_failure_means_success_false(mock_run, scenario_dir: Path):
+def test_openclaw_runner_check_failure_means_success_false(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
     """Agent succeeds but check_state returns non-expected exit → success=False."""
     agent = _agent_mock(
         stdout='{"event": "turn_complete", "input_tokens": 50, "output_tokens": 10}'
@@ -121,7 +123,8 @@ def test_openclaw_runner_baseline_strips_agent_desktop_from_path(
     mock_run, scenario_dir: Path, tmp_path: Path, monkeypatch
 ):
     """BASELINE mode must invoke the agent subprocess with PATH stripped of agent-desktop dirs."""
-    # Set up a fake PATH with one dir containing agent-desktop and one without
+    # Set up a fake PATH with one dir containing agent-desktop and one without.
+    # Also stage an openclaw binary so OpenClawRunner can resolve it at init.
     has_ad = tmp_path / "with_ad"
     has_ad.mkdir()
     fake_ad = has_ad / "agent-desktop"
@@ -129,6 +132,9 @@ def test_openclaw_runner_baseline_strips_agent_desktop_from_path(
     fake_ad.chmod(0o755)
     no_ad = tmp_path / "without_ad"
     no_ad.mkdir()
+    oc_bin = no_ad / "openclaw"
+    oc_bin.write_text("#!/bin/bash\nexit 0\n")
+    oc_bin.chmod(0o755)
     monkeypatch.setenv("PATH", f"{has_ad}:{no_ad}")
 
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
@@ -152,6 +158,9 @@ def test_openclaw_runner_augmented_keeps_path_intact(
     fake_ad = has_ad / "agent-desktop"
     fake_ad.touch()
     fake_ad.chmod(0o755)
+    oc_bin = has_ad / "openclaw"
+    oc_bin.write_text("#!/bin/bash\nexit 0\n")
+    oc_bin.chmod(0o755)
     monkeypatch.setenv("PATH", str(has_ad))
 
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
@@ -164,7 +173,9 @@ def test_openclaw_runner_augmented_keeps_path_intact(
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_timeout_returns_failure_result(mock_run, scenario_dir: Path):
+def test_openclaw_runner_timeout_returns_failure_result(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
     """subprocess.TimeoutExpired → RunResult with success=False, error mentions timeout."""
     mock_run.side_effect = subprocess.TimeoutExpired(cmd="openclaw", timeout=30)
 
@@ -189,8 +200,43 @@ def test_openclaw_runner_handles_missing_binary(scenario_dir: Path):
     assert "failed to spawn" in result.error.lower()
 
 
+def test_baseline_mode_still_finds_openclaw_when_co_located(
+    scenario_dir: Path, tmp_path: Path, monkeypatch
+):
+    """If openclaw and agent-desktop live in the same directory (e.g. ~/.local/bin),
+    BASELINE-mode PATH stripping must not prevent the spawn from finding openclaw.
+
+    Resolution: OpenClawRunner resolves the binary to an absolute path at __init__
+    via shutil.which, so the spawn call is unaffected by PATH manipulation.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    openclaw_bin = bindir / "openclaw"
+    openclaw_bin.write_text("#!/bin/bash\necho '{}'\nexit 0\n")
+    openclaw_bin.chmod(0o755)
+    ad_bin = bindir / "agent-desktop"
+    ad_bin.touch()
+    ad_bin.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bindir))
+
+    runner = OpenClawRunner(openclaw_bin="openclaw")
+    scenario = Scenario.load(scenario_dir)
+
+    with patch("agent_desktop_evals.runners.openclaw.subprocess.run") as mock_run:
+        mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
+        result = runner.run(scenario, mode=Mode.BASELINE)
+
+    # The spawn call must use the absolute path resolved at init,
+    # not the bare name (which would fail to be found after PATH-strip).
+    spawn_args = mock_run.call_args_list[0].args[0]
+    assert spawn_args[0] == str(openclaw_bin), (
+        f"expected absolute path {openclaw_bin}, got {spawn_args[0]}"
+    )
+    assert "failed to spawn" not in (result.error or "")
+
+
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path):
+def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """If the check_state subprocess times out, surface error mentioning check_state timeout."""
     agent = _agent_mock(
         stdout='{"event": "turn_complete", "input_tokens": 100, "output_tokens": 50}'

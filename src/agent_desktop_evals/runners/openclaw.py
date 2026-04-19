@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -37,16 +38,34 @@ class OpenClawRunner:
     name = "openclaw"
 
     def __init__(self, openclaw_bin: str = "openclaw"):
-        self._bin = openclaw_bin
+        # Resolve to an absolute path at init time. This way, BASELINE-mode
+        # PATH-stripping (which removes dirs containing agent-desktop) doesn't
+        # also break openclaw when both binaries live in the same directory.
+        # The resolved spawn path is invariant; PATH only affects what the
+        # *agent* subprocess can subsequently look up.
+        if os.path.isabs(openclaw_bin):
+            self._bin = openclaw_bin if Path(openclaw_bin).exists() else None
+        else:
+            self._bin = shutil.which(openclaw_bin)
+        self._requested_bin = openclaw_bin
 
     def run(self, scenario: Scenario, mode: Mode) -> RunResult:
+        started = now_iso()
+        t0 = time.monotonic()
+
+        if self._bin is None:
+            return RunResult(
+                scenario_id=scenario.id, runner_name=self.name, mode=mode,
+                success=False, tokens=0, screenshots=0,
+                wallclock_s=time.monotonic() - t0, started_at_iso=started,
+                error=f"failed to spawn {self._requested_bin}: not found on PATH",
+            )
+
         env = os.environ.copy()
         if mode == Mode.BASELINE:
             # Strip directories containing agent-desktop from PATH
             env["PATH"] = self._strip_agent_desktop(env.get("PATH", ""))
 
-        started = now_iso()
-        t0 = time.monotonic()
         try:
             proc = subprocess.run(
                 [self._bin, "chat", "--print", "--json", scenario.prompt],
@@ -109,12 +128,13 @@ class OpenClawRunner:
 
     @staticmethod
     def _strip_agent_desktop(path: str) -> str:
-        """Remove any PATH entry that contains an agent-desktop binary."""
+        """Remove any PATH entry that contains an executable agent-desktop binary."""
         kept: list[str] = []
         for d in path.split(os.pathsep):
             if not d:
                 continue
-            if Path(d, "agent-desktop").exists():
+            candidate = Path(d, "agent-desktop")
+            if candidate.exists() and os.access(candidate, os.X_OK):
                 continue
             kept.append(d)
         return os.pathsep.join(kept)
