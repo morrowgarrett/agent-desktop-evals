@@ -1,9 +1,10 @@
-from agent_desktop_evals.report import render_csv, render_markdown
+from agent_desktop_evals.report import _format_tool_calls, render_csv, render_markdown
 from agent_desktop_evals.runner_base import Mode, RunResult
 
 
 def _result(scenario="a-gnome-settings", runner="openclaw", mode=Mode.BASELINE,
-            success=True, tokens=1000, screenshots=2, wallclock_s=12.3):
+            success=True, tokens=1000, screenshots=2, wallclock_s=12.3,
+            tool_calls=None):
     return RunResult(
         scenario_id=scenario,
         runner_name=runner,
@@ -13,6 +14,7 @@ def _result(scenario="a-gnome-settings", runner="openclaw", mode=Mode.BASELINE,
         screenshots=screenshots,
         wallclock_s=wallclock_s,
         started_at_iso="2026-04-18T12:00:00+00:00",
+        tool_calls=tool_calls or {},
     )
 
 
@@ -77,3 +79,41 @@ def test_render_markdown_handles_only_one_mode():
     # The header row contains the literal "mode" cell label.
     data_rows = [line for line in table_lines if "| baseline " in line or "| augmented " in line]
     assert len(data_rows) == 1, f"expected 1 data row, got {len(data_rows)}: {data_rows}"
+
+
+def test_render_csv_includes_tool_calls():
+    results = [_result(tool_calls={"exec": 5, "read": 1})]
+    csv = render_csv(results)
+    lines = csv.strip().splitlines()
+    assert "tool_calls" in lines[0]
+    # CSV will quote the value containing a comma
+    assert "exec:5,read:1" in lines[1] or '"exec:5,read:1"' in lines[1]
+
+
+def test_render_csv_handles_empty_tool_calls():
+    import csv as csv_module
+    import io
+    results = [_result(tool_calls={})]
+    csv = render_csv(results)
+    lines = csv.strip().splitlines()
+    headers = lines[0].split(",")
+    tc_idx = headers.index("tool_calls")
+    row = next(csv_module.reader(io.StringIO(lines[1])))
+    assert row[tc_idx] == "", f"expected empty tool_calls, got {row[tc_idx]!r}"
+
+
+def test_render_markdown_includes_tool_calls_column():
+    results = [_result(tool_calls={"exec": 4, "read": 7, "process": 2})]
+    md = render_markdown(results)
+    assert "tool calls" in md
+    # Sorted by count desc, then by name asc on ties
+    assert "read:7,exec:4,process:2" in md
+
+
+def test_format_tool_calls_sorted_desc_then_name():
+    """Ties broken by name ascending."""
+    assert _format_tool_calls({"a": 3, "b": 5, "c": 5}) == "b:5,c:5,a:3"
+
+
+def test_format_tool_calls_empty():
+    assert _format_tool_calls({}) == ""

@@ -7,6 +7,19 @@ from collections import defaultdict
 from agent_desktop_evals.runner_base import Mode, RunResult
 
 
+def _format_tool_calls(tool_calls: dict[str, int]) -> str:
+    """Render tool_calls dict as 'name1:N1,name2:N2,...' sorted by count desc.
+
+    Ties on count are broken by name ascending. Empty dict returns "".
+    Shared by report.py and cli.py to keep a single source of truth for the
+    on-disk and on-stdout format.
+    """
+    if not tool_calls:
+        return ""
+    items = sorted(tool_calls.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ",".join(f"{n}:{c}" for n, c in items)
+
+
 def render_markdown(results: list[RunResult]) -> str:
     """Render a paired-mode comparison report."""
     if not results:
@@ -24,14 +37,15 @@ def render_markdown(results: list[RunResult]) -> str:
     for (scenario, runner), modes in sorted(by_pair.items()):
         lines.append(f"## {scenario} × {runner}")  # noqa: RUF001  # multiplication sign is intentional
         lines.append("")
-        lines.append("| mode | success | tokens | screenshots | wall-clock (s) |")
-        lines.append("|------|---------|--------|-------------|----------------|")
+        lines.append("| mode | success | tokens | screenshots | tool calls | wall-clock (s) |")
+        lines.append("|------|---------|--------|-------------|------------|----------------|")
         for mode in (Mode.BASELINE, Mode.AUGMENTED):
             if mode in modes:
                 r = modes[mode]
+                tc = _format_tool_calls(r.tool_calls) or "—"  # em-dash for empty
                 lines.append(
                     f"| {mode.value} | {'✓' if r.success else '✗'} | {r.tokens} "
-                    f"| {r.screenshots} | {r.wallclock_s:.2f} |"
+                    f"| {r.screenshots} | {tc} | {r.wallclock_s:.2f} |"
                 )
         if Mode.BASELINE in modes and Mode.AUGMENTED in modes:
             b, a = modes[Mode.BASELINE], modes[Mode.AUGMENTED]
@@ -43,7 +57,7 @@ def render_markdown(results: list[RunResult]) -> str:
             )
             lines.append(
                 f"| **delta (savings)** | — | {tok_savings} | {shot_savings} "
-                f"| {(b.wallclock_s - a.wallclock_s):+.2f} |"
+                f"| — | {(b.wallclock_s - a.wallclock_s):+.2f} |"
             )
         lines.append("")
 
@@ -68,11 +82,12 @@ def render_csv(results: list[RunResult]) -> str:
     writer = csv.writer(buf)
     writer.writerow([
         "scenario_id", "runner_name", "mode", "success",
-        "tokens", "screenshots", "wallclock_s", "steps", "started_at_iso",
+        "tokens", "screenshots", "tool_calls", "wallclock_s", "steps", "started_at_iso",
     ])
     for r in results:
         writer.writerow([
             r.scenario_id, r.runner_name, r.mode.value, r.success,
-            r.tokens, r.screenshots, f"{r.wallclock_s:.3f}", r.steps, r.started_at_iso,
+            r.tokens, r.screenshots, _format_tool_calls(r.tool_calls),
+            f"{r.wallclock_s:.3f}", r.steps, r.started_at_iso,
         ])
     return buf.getvalue()

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import click
 
-from agent_desktop_evals.report import render_csv, render_markdown
+from agent_desktop_evals.report import _format_tool_calls, render_csv, render_markdown
 from agent_desktop_evals.runner_base import Mode, RunResult
 from agent_desktop_evals.runners.openclaw import OpenClawRunner
 from agent_desktop_evals.runners.stub import StubRunner
@@ -45,10 +45,7 @@ def run(scenario_path: Path, runner: str, mode: str, report_dir: Path) -> None:
         f"screenshots={result.screenshots} wallclock={result.wallclock_s:.2f}s"
     )
     if result.tool_calls:
-        # Sort by count desc, then by name asc for stable tie-breaking.
-        ordered = sorted(result.tool_calls.items(), key=lambda kv: (-kv[1], kv[0]))
-        rendered = ",".join(f"{name}:{count}" for name, count in ordered)
-        summary += f" tool_calls={rendered}"
+        summary += f" tool_calls={_format_tool_calls(result.tool_calls)}"
     click.echo(summary)
     if result.parse_warnings > 0:
         click.echo(
