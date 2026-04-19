@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from agent_desktop_evals.runner_base import Mode
+import pytest
+
+from agent_desktop_evals.runner_base import Mode, RunResult
 from agent_desktop_evals.runners.openclaw import OpenClawRunner, _parse_metrics
 from agent_desktop_evals.scenario import Scenario
 
@@ -85,14 +88,23 @@ def test_parse_metrics_skips_banner_with_brace():
 
 
 def test_parse_metrics_handles_multiple_json_objects():
-    """Multiple JSON objects (e.g., streamed events): sum usage from each that has a usage block."""
+    """Multiple JSON objects: last-cumulative-wins (NOT sum).
+
+    OpenClaw's mergeUsageIntoAccumulator (pi-embedded-Vw-lS5ti.js:32847) populates
+    usage via `target.input += usage.input` — every emission of agentMeta carries
+    the running cumulative usageAccumulator, not a per-event delta. Summing across
+    objects would N-count tokens for any future stream / retry / error-path
+    multi-emit shape. Take the last cumulative total instead.
+    """
     transcript = (
         '{"meta": {"agentMeta": {"usage": {"input": 100, "output": 50, "total": 150}}}}'
         "\n"
         '{"meta": {"agentMeta": {"usage": {"input": 200, "output": 100, "total": 300}}}}'
     )
     result = _parse_metrics(transcript)
-    assert result["tokens"] == 450, f"expected sum 150+300, got {result}"
+    assert result["tokens"] == 300, (
+        f"expected last-cumulative 300, NOT sum 450 (cumulative semantics), got {result}"
+    )
     assert result["parse_warnings"] == 0
 
 
@@ -128,17 +140,41 @@ def test_parse_metrics_skips_banner_before_json():
     assert metrics["parse_warnings"] == 0
 
 
-def test_parse_metrics_unparseable_json_with_no_other_objects_silently_zeros():
-    """If a `{` appears but does not begin valid JSON and no other JSON object follows,
-    parser silently zeros — noise on its own is not a warning, only mis-shaped data is.
+def test_parse_metrics_corrupted_json_warns_not_silently_zeros():
+    """If a `{` appears in input but every raw_decode attempt from each `{` fails,
+    that's corruption — operator must get a parse_warning signal.
 
-    Trade-off vs the prior behavior: robustness to log noise is more important than
-    flagging every stray `{` in banner output.
+    Reverses the prior behavior. The earlier 'silently zero' policy made
+    corrupted streams (e.g., U+FFFD landed inside a JSON value via
+    errors='replace') indistinguishable from a no-run case. Now: at least one
+    `{` present + zero successfully-decoded objects ⇒ parse_warnings >= 1.
     """
-    transcript = "banner line\n{not valid json at all"
+    # Repro of the U+FFFD corruption case from the review.
+    transcript = '{"meta":{"agentMeta":{"usage":{"input":1\ufffd00,"output":50}}}}'
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["screenshots"] == 0
+    assert metrics["parse_warnings"] >= 1, (
+        f"corruption must surface as warning, got {metrics}"
+    )
+
+    # Original "banner line\n{not valid json at all" — also corruption, also warns.
+    transcript2 = "banner line\n{not valid json at all"
+    metrics2 = _parse_metrics(transcript2)
+    assert metrics2["tokens"] == 0
+    assert metrics2["parse_warnings"] >= 1, (
+        f"a `{{` that fails to decode must warn, got {metrics2}"
+    )
+
+
+def test_parse_metrics_pure_noise_with_no_brace_does_not_warn():
+    """Pure noise (no `{` in input at all) is empty-equivalent: zeros, no warnings.
+
+    This carves the legitimate 'no JSON ever' case out of the corruption path:
+    no `{` ⇒ never even attempted a decode ⇒ no warning to emit.
+    """
+    metrics = _parse_metrics("just banner text\n[plugins] no braces here\n")
+    assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 0
 
 
@@ -152,13 +188,6 @@ def test_parse_metrics_warns_when_usage_missing():
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 1
-
-
-def test_parse_metrics_no_brace_in_input():
-    """Input with no `{` at all is empty-equivalent: zeros, no warnings."""
-    metrics = _parse_metrics("just some banner output\n[plugins] etc")
-    assert metrics["tokens"] == 0
-    assert metrics["parse_warnings"] == 0
 
 
 def test_parse_metrics_rejects_negative_tokens():
@@ -183,6 +212,61 @@ def test_parse_metrics_rejects_floats():
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_tolerates_unknown_usage_fields_with_warning():
+    """Schema drift: a future OpenClaw adding an unknown key (e.g., reasoning_tokens
+    for o-series / gpt-5 reasoning models) must NOT hard-zero the run.
+
+    extra='allow' on the _Usage model lets the known fields through; the parser
+    surfaces the drift as a parse_warning rather than treating the whole run as
+    corrupt. This is a publication-blocker if missed: an OpenClaw release with a
+    new usage field would otherwise silently report tokens=0 across every run.
+    """
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "total": 150, "reasoning": 500}}}}'
+    )
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 150, (
+        f"unknown usage field must NOT zero known counts, got {metrics}"
+    )
+    assert metrics["parse_warnings"] >= 1, (
+        f"unknown usage field must surface as drift warning, got {metrics}"
+    )
+
+
+def test_parse_metrics_total_zero_with_nonzero_components_falls_through():
+    """Defensive: if upstream ever buggily emits total=0 alongside nonzero components,
+    truthy fall-through to the sum self-heals. (Pure-truthy check on usage.total.)
+    """
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "cacheRead": 200, "cacheWrite": 0, "total": 0}}}}'
+    )
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 350, (
+        f"total=0 with nonzero components must fall through to component sum, got {metrics}"
+    )
+
+
+def test_parse_metrics_bounds_pathological_brace_input():
+    """Adversarial input of many stray `{` must not hang on O(N^2) decode attempts.
+
+    100K stray braces should complete fast and produce a single parse_warning
+    when the bound is hit (per the 'failed_decodes > 0 and no objects' branch).
+    """
+    transcript = "{" * 100_000
+    import time as _time
+    t0 = _time.monotonic()
+    metrics = _parse_metrics(transcript)
+    elapsed = _time.monotonic() - t0
+    # Bound is 10000 attempts; each empty raw_decode is microseconds. Allow generous slack.
+    assert elapsed < 5.0, f"bounded loop must complete fast; took {elapsed:.2f}s"
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] >= 1, (
+        f"pathological corruption must surface a warning, got {metrics}"
+    )
 
 
 # --- _strip_agent_desktop tests ---
@@ -460,46 +544,52 @@ def test_openclaw_runner_agent_id_is_configurable(
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_parses_stderr_not_stdout(
+def test_parses_concatenated_streams_not_stdout_only(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
-    """OpenClaw emits its JSON on STDERR, not stdout. Runner must parse from stderr.
+    """Verified against OpenClaw source: register.agent-DSGqePoo.js:95 →
+    writeRuntimeJson → runtime-BXaxArxm.js:21 writeStdout → process.stdout.write.
+    JSON goes to STDOUT; the colored '[plugins]' banner from console.error goes
+    to stderr. Our smoke fixture is a `2>&1` capture interleaving them.
 
-    Regression: previous implementation read proc.stdout, which is empty for openclaw,
-    causing tokens to silently be 0 on every real run.
+    The runner concatenates BOTH streams through _parse_metrics so it captures
+    the JSON regardless of which stream emits it. This test pins the dual-stream
+    behavior by placing the real fixture on stderr (legacy regression shape) and
+    a sentinel on stdout — fixture's tokens must still reach the result.
     """
     fixture = SMOKE_FIXTURE.read_text()
-    # Sentinel the alternate stream so we can detect a regression to stdout-only:
-    # if a future change reads only stdout, it would see this banner-only blob and
-    # parse zero — that's the bug shape we want to catch.
     sentinel_stdout = "[plugins] noise on stdout that contains no usage block\n"
     agent_call = MagicMock(returncode=0, stdout=sentinel_stdout, stderr=fixture)
     check_call = MagicMock(returncode=0)
     mock_run.side_effect = [agent_call, check_call]
     result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
     # 148727 = real fixture's precomputed total (input 114 + output 5 + cacheRead 148608).
-    # Asserting the exact number ensures we're parsing stderr (where the JSON lives),
-    # not stdout (which here is sentinel banner-only and would parse to 0 tokens).
     assert result.tokens == 148727, (
-        f"expected 148727 tokens from stderr fixture, got {result.tokens}"
+        f"expected 148727 tokens from concatenated streams, got {result.tokens}"
     )
     assert result.success is True
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_falls_back_to_stdout_if_stderr_empty(
+def test_parses_concatenated_streams_with_fixture_on_stdout(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
-    """If openclaw ever changes which stream it emits on, parsing should not regress.
-
-    The runner combines stdout+stderr through _parse_metrics so the metrics still
-    surface either way."""
-    body = _stderr_blob(200, 50)
-    agent_call = MagicMock(returncode=0, stdout=body, stderr="")
+    """Mirror of the above: real OpenClaw writes JSON to STDOUT (the smoke
+    fixture is a 2>&1 capture). Place the fixture on stdout, banner sentinel on
+    stderr — tokens must still extract. Together with the previous test this
+    catches a regression in either direction (stdout-only or stderr-only).
+    """
+    fixture = SMOKE_FIXTURE.read_text()
+    sentinel_stderr = "[plugins] noise on stderr that contains no usage block\n"
+    agent_call = MagicMock(returncode=0, stdout=fixture, stderr=sentinel_stderr)
     check_call = MagicMock(returncode=0)
     mock_run.side_effect = [agent_call, check_call]
     result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
-    assert result.tokens == 250
+    assert result.tokens == 148727, (
+        f"expected 148727 tokens from stdout fixture (real OpenClaw shape), "
+        f"got {result.tokens}"
+    )
+    assert result.success is True
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
@@ -555,19 +645,28 @@ def test_openclaw_runner_uses_errors_replace_for_subprocess_decoding(
         )
 
 
-@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_handles_unicode_decode_error_gracefully(
-    mock_run, scenario_dir: Path, fake_openclaw_on_path
-):
-    """Belt-and-suspenders: if subprocess.run raises UnicodeDecodeError despite
-    errors='replace' (e.g., a future code path forgets the kwarg), the runner
-    must surface a failure RunResult instead of crashing the eval."""
-    mock_run.side_effect = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell-out")
+def test_real_subprocess_with_invalid_utf8_does_not_crash(scenario_dir: Path, tmp_path: Path):
+    """Replaces the prior mock-only UnicodeDecodeError test, which couldn't
+    actually fire (subprocess.run with text=True, errors='replace' substitutes
+    U+FFFD for bad bytes — never raises). This is a real integration test:
+    spawn a tiny shell script that emits a bad UTF-8 byte and verify the runner
+    produces a RunResult instead of crashing.
 
-    scenario = Scenario.load(scenario_dir)
-    result = OpenClawRunner().run(scenario, mode=Mode.AUGMENTED)
-
-    assert result.success is False
+    The test_uses_errors_replace_for_subprocess_decoding test below remains the
+    structural guarantee that errors='replace' is in fact passed to both calls.
+    """
+    fake_bin = tmp_path / "fake-openclaw"
+    # \xc3 starts a 2-byte UTF-8 sequence; \x28 is a stray byte that breaks the
+    # sequence — perfect adversarial input for the decoder.
+    fake_bin.write_text("#!/bin/sh\nprintf '\\xc3\\x28'\nexit 0\n")
+    fake_bin.chmod(0o755)
+    runner = OpenClawRunner(openclaw_bin=str(fake_bin))
+    result = runner.run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert isinstance(result, RunResult), (
+        f"runner must return RunResult instead of crashing on bad UTF-8, got {type(result)!r}"
+    )
+    # tokens must be 0 (no JSON in our bad-bytes payload), parse must not warn
+    # (no `{` in the input ⇒ pure-noise path, not corruption path).
     assert result.tokens == 0
-    assert result.error is not None
-    assert "failed to spawn" in result.error.lower()
+    assert result.parse_warnings == 0

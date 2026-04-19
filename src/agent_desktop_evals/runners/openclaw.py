@@ -14,19 +14,22 @@ from agent_desktop_evals.scenario import Scenario
 
 
 class _Usage(BaseModel):
-    """Strict shape for the meta.agentMeta.usage block emitted by OpenClaw 2026.4.9.
+    """Shape for the meta.agentMeta.usage block emitted by OpenClaw 2026.4.9.
 
     Tokens must be non-negative ints; strings, floats, negatives reject so that
-    upstream-format drift surfaces as a parse_warning rather than silently
-    miscounting. extra='forbid' so that future schema additions surface as
-    parse errors instead of silent token drops.
+    upstream-format drift on KNOWN fields surfaces as a parse_warning rather
+    than silently miscounting.
+
+    extra='allow' (NOT 'forbid'): the day OpenClaw adds e.g. reasoning_tokens
+    for o-series / gpt-5 reasoning models, we'd otherwise hard-zero every run
+    with a parse_warning. Allow unknown keys, surface them via model_extra in
+    _parse_metrics as a drift signal, but keep the known counts flowing.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
-    # Field names mirror the upstream OpenClaw JSON keys verbatim so that
-    # extra='forbid' validation works without aliasing. N815 (mixedCase) is
-    # therefore intentional.
+    # Field names mirror the upstream OpenClaw JSON keys verbatim. Aliasing
+    # would let typos pass; keeping mixedCase verbatim is intentional.
     input: NonNegativeInt = 0
     output: NonNegativeInt = 0
     cacheRead: NonNegativeInt = 0  # noqa: N815
@@ -35,39 +38,57 @@ class _Usage(BaseModel):
 
 
 def _tokens_from_usage(usage: _Usage) -> int:
-    """Use the precomputed total when present; otherwise sum all four fields.
+    """Use the precomputed total when truthy; otherwise sum all four fields.
 
     OpenClaw's createUsageAccumulator precomputes total = input+output+cacheRead+cacheWrite;
     we prefer that over re-summing to avoid drift if the upstream definition changes.
+    Truthy (not 'is not None') so a buggy upstream emitting total=0 with nonzero
+    components self-heals to the component sum rather than reporting zero.
     """
-    if usage.total is not None:
+    if usage.total:
         return usage.total
     return usage.input + usage.output + usage.cacheRead + usage.cacheWrite
 
 
-def _find_json_objects(text: str) -> list[dict]:
+# Bound on raw_decode attempts that fail before we declare the input
+# pathologically corrupt. Real OpenClaw outputs have a single-digit number of
+# braces in banners; 10K is generous insurance against an adversarial worst
+# case (e.g., stderr spam of stray `{`) without bailing on real noise.
+_MAX_FAILED_DECODE_ATTEMPTS = 10_000
+
+
+def _find_json_objects(text: str) -> tuple[list[dict], int]:
     """Find all top-level JSON objects in a text stream, ignoring non-JSON content.
 
     Uses json.JSONDecoder.raw_decode to scan past banners, log lines, and other
     noise; advances past each successfully decoded object and continues scanning.
     Skips '{' that don't begin valid JSON (e.g., banners containing braces).
+
+    Returns (objects, failed_decode_attempts). The caller uses the failed count
+    to distinguish 'no `{` in input at all' (truly noise — OK) from 'found `{`
+    but every raw_decode attempt failed' (corruption — must warn).
+
+    Bounded at _MAX_FAILED_DECODE_ATTEMPTS to prevent O(N^2) hangs on
+    adversarial inputs like 100K stray braces.
     """
     decoder = json.JSONDecoder()
     objects: list[dict] = []
+    failed = 0
     i = 0
-    while i < len(text):
+    while i < len(text) and failed < _MAX_FAILED_DECODE_ATTEMPTS:
         brace = text.find("{", i)
         if brace == -1:
             break
         try:
             obj, end_offset = decoder.raw_decode(text[brace:])
         except json.JSONDecodeError:
+            failed += 1
             i = brace + 1  # this '{' didn't start valid JSON; advance and retry
             continue
         if isinstance(obj, dict):
             objects.append(obj)
         i = brace + end_offset
-    return objects
+    return objects, failed
 
 
 def _parse_metrics(transcript: str) -> dict[str, int]:
@@ -76,8 +97,8 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
     Real shape, captured 2026-04-18 from `openclaw agent --agent main --local
     --message ... --json` (see tests/fixtures/openclaw-smoke-output.txt):
 
-        [plugins] plugins.allow is empty; ...   <-- non-JSON banner on first line
-        {
+        [plugins] plugins.allow is empty; ...   <-- non-JSON banner on stderr
+        {                                       <-- JSON on STDOUT
           "payloads": [...],
           "meta": {
             "agentMeta": {
@@ -87,9 +108,15 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
           }
         }
 
-    Strategy: scan for all top-level JSON objects (raw_decode) and sum usage
-    from each that has a meta.agentMeta.usage block. This is robust against
-    trailing logs, banners with braces, multiple JSON objects, and noise.
+    Verified against OpenClaw source at register.agent-DSGqePoo.js:95 →
+    writeRuntimeJson → runtime-BXaxArxm.js:21 writeStdout (process.stdout.write).
+    The smoke fixture is a 2>&1 capture interleaving streams.
+
+    Cumulative semantics: per pi-embedded-Vw-lS5ti.js:32847 mergeUsageIntoAccumulator,
+    every emission of agentMeta carries the running cumulative usageAccumulator
+    (target.input += usage.input). Across multiple JSON objects we take the LAST
+    cumulative total — summing would N-count tokens for any future stream,
+    retry, or interim error-path agentMeta emission.
 
     TODO(screenshots): real tool-usage shape is unknown — the smoke fixture
     only contains tool *definitions* under meta.agentMeta.systemPromptReport.
@@ -99,12 +126,17 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
     screenshots = 0  # TODO: refine when we have tool-usage output to inspect
     parse_warnings = 0
 
-    objects = _find_json_objects(transcript)
+    objects, failed_decodes = _find_json_objects(transcript)
     if not objects:
-        # No valid JSON found at all — empty input, banner-only, or unparseable noise.
-        # Per design, noise on its own is not a warning.
-        return {"tokens": 0, "screenshots": 0, "parse_warnings": 0}
+        # Distinguish two cases:
+        #   - failed_decodes == 0: no `{` in input ⇒ pure noise/empty (silent OK).
+        #   - failed_decodes  > 0: `{` present but every raw_decode failed ⇒
+        #     corruption (e.g., U+FFFD landed in a JSON value via errors='replace',
+        #     or pathological input hit the bound). Operator must get a signal.
+        warnings = 1 if failed_decodes > 0 else 0
+        return {"tokens": 0, "screenshots": 0, "parse_warnings": warnings}
 
+    last_total = None
     for data in objects:
         meta = data.get("meta")
         if not isinstance(meta, dict):
@@ -123,8 +155,13 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
         except ValidationError:
             parse_warnings += 1
             continue
-        tokens += _tokens_from_usage(usage)
+        # Schema drift: unknown keys pass extra='allow' but must surface as a
+        # warning so we notice and update the model deliberately.
+        if usage.model_extra:
+            parse_warnings += 1
+        last_total = _tokens_from_usage(usage)
 
+    tokens = last_total or 0
     return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
 
@@ -179,10 +216,13 @@ class OpenClawRunner:
                 timeout=scenario.timeout_seconds,
                 check=False,
             )
-            # OpenClaw 2026.4.9 writes its JSON to STDERR (after a banner line).
-            # Concatenate both streams so a future shift to stdout doesn't regress
-            # token accounting.
-            transcript = (proc.stderr or "") + (proc.stdout or "")
+            # OpenClaw 2026.4.9 writes its JSON to STDOUT (verified against
+            # register.agent-DSGqePoo.js:95 → writeRuntimeJson →
+            # runtime-BXaxArxm.js:21 writeStdout → process.stdout.write). The
+            # colored '[plugins]' banner from console.error goes to stderr.
+            # Concatenate both streams so the parser still recovers tokens if
+            # OpenClaw ever shifts which stream it emits on.
+            transcript = (proc.stdout or "") + (proc.stderr or "")
             error = proc.stderr if proc.returncode != 0 else None
         except subprocess.TimeoutExpired:
             return RunResult(
