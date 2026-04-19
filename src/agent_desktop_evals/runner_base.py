@@ -32,6 +32,12 @@ class RunResult(BaseModel):
     # the per-session JSONL after the run). Non-introspecting runners leave
     # this empty.
     tool_calls: dict[str, int] = Field(default_factory=dict)
+    # The session id used by the agent for this run, when known. OpenClawRunner
+    # generates a fresh uuid4 per run() and passes it as `--session-id` to
+    # prevent context contamination across runs (without this, the persistent
+    # `--agent <id>` session accumulates context across all invocations).
+    # Non-OpenClaw runners leave this None.
+    session_id: str | None = None
 
 
 class Runner(Protocol):

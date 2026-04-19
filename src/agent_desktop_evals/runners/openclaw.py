@@ -7,6 +7,7 @@ import shlex
 import shutil
 import subprocess
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -318,8 +319,11 @@ class OpenClawRunner:
         else:
             self._bin = shutil.which(openclaw_bin)
         self._requested_bin = openclaw_bin
-        # OpenClaw 2026.4.9 requires --agent / --to / --session-id; "main" is
-        # the user's default agent id and matches typical local installs.
+        # The agent_id is no longer passed as --agent on the CLI (that
+        # caused session reuse — see run() docstring); instead it drives
+        # the per-session JSONL lookup path under
+        # ~/.openclaw/agents/<agent_id>/sessions/. "main" matches the
+        # user's default agent and typical local installs.
         self._agent_id = agent_id
         # Sentinel resolution: _DEFAULT_TRANSCRIPT_DIR ⇒ Path("reports/raw")
         # resolved against CWD at run-time (NOT init-time, so monkeypatched
@@ -341,12 +345,36 @@ class OpenClawRunner:
         started = now_iso()
         t0 = time.monotonic()
 
+        # Generate a fresh uuid4 per run to prevent context contamination.
+        # Without this, every invocation reuses the persistent session keyed
+        # by --agent <id> and the agent accumulates context across runs —
+        # observed empirically in scenario B pass-4 where the baseline agent
+        # tried agent-desktop 3 times despite no SKILL.md being loaded,
+        # because earlier same-session runs had established the tool.
+        #
+        # Verified empirically against OpenClaw 2026.4.9 on 2026-04-18:
+        # passing BOTH --agent <id> AND --session-id <uuid> is accepted by
+        # the CLI but --agent wins for session routing — the persistent
+        # session file is still appended to and a NEW file is NOT created.
+        # The reported agentMeta.sessionId in JSON output is the persistent
+        # session id, NOT the --session-id we passed.
+        #
+        # Working path: pass ONLY --session-id (drop --agent). OpenClaw still
+        # uses the same default provider/model (openai-codex/gpt-5.4) and
+        # writes the session log under ~/.openclaw/agents/<agent_id>/sessions/
+        # because main is the default agent namespace; sessionKey becomes
+        # `agent:<id>:explicit:<uuid>`. Verified: a fresh session log file
+        # IS created per run with the exact UUID we pass, and the JSON output
+        # reports our UUID as the sessionId. self._agent_id is still used to
+        # locate the per-session JSONL for tool-call extraction.
+        session_id = str(uuid.uuid4())
+
         # Pre-build the spawn argv even on the missing-binary path, so the
         # transcript can record what we *would* have invoked. This keeps the
         # failure-path transcript informative for post-facto auditing.
         argv = [
             self._bin or self._requested_bin, "agent",
-            "--agent", self._agent_id,
+            "--session-id", session_id,
             "--local",
             "--message", scenario.prompt,
             "--json",
@@ -360,6 +388,7 @@ class OpenClawRunner:
                 argv=argv, stderr=error, stdout="",
                 returncode=-1, success=False, error=error,
                 tokens=0, screenshots=0, parse_warnings=0,
+                session_id=session_id,
             )
 
         env = os.environ.copy()
@@ -398,6 +427,7 @@ class OpenClawRunner:
                 argv=argv, stderr=partial_stderr or err_msg, stdout=partial_stdout,
                 returncode=-1, success=False, error=err_msg,
                 tokens=0, screenshots=0, parse_warnings=0,
+                session_id=session_id,
             )
         except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError) as e:
             # UnicodeDecodeError is defensive belt-and-suspenders: errors='replace'
@@ -410,15 +440,19 @@ class OpenClawRunner:
                 argv=argv, stderr=err_msg, stdout="",
                 returncode=-1, success=False, error=err_msg,
                 tokens=0, screenshots=0, parse_warnings=0,
+                session_id=session_id,
             )
 
         wallclock_s = time.monotonic() - t0
         metrics = _parse_metrics(transcript)
-        # Tool-call introspection: only attempt when OpenClaw exposed a
-        # sessionId we can use to anchor reads in the per-session JSONL.
-        # Failed-agent runs may still expose sessionId — try anyway so failure
-        # transcripts carry tool-call evidence when available.
-        tool_calls = self._read_tool_calls(transcript, scenario.prompt)
+        # Tool-call introspection: prefer the sessionId OpenClaw reports back
+        # (in case it differs from what we passed via --session-id), falling
+        # back to the id we generated. Failed-agent runs may still expose
+        # sessionId — try anyway so failure transcripts carry tool-call
+        # evidence when available.
+        reported_sid = _extract_session_id(transcript)
+        effective_sid = reported_sid or session_id
+        tool_calls = self._read_tool_calls(effective_sid, scenario.prompt)
 
         # Even if check_state would pass, a failed agent invocation must not be
         # reported as success: a leftover desktop state from a prior run could
@@ -435,6 +469,7 @@ class OpenClawRunner:
                 tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
                 tool_calls=tool_calls,
+                session_id=effective_sid,
             )
 
         # Verify success via the scenario's check script.
@@ -457,6 +492,7 @@ class OpenClawRunner:
                 tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
                 tool_calls=tool_calls,
+                session_id=effective_sid,
             )
         success = check.returncode == scenario.expect_exit_code
 
@@ -468,9 +504,10 @@ class OpenClawRunner:
             tokens=metrics["tokens"], screenshots=metrics["screenshots"],
             parse_warnings=metrics["parse_warnings"],
             tool_calls=tool_calls,
+            session_id=effective_sid,
         )
 
-    def _read_tool_calls(self, transcript: str, prompt: str) -> dict[str, int]:
+    def _read_tool_calls(self, session_id: str | None, prompt: str) -> dict[str, int]:
         """Extract per-tool invocation counts from the OpenClaw session log.
 
         Passes both the sessionId (resolves the file path) and the prompt
@@ -478,12 +515,11 @@ class OpenClawRunner:
         runs into the same session file). Returns an empty dict (without
         crashing) whenever:
 
-        - OpenClaw output didn't expose a sessionId,
+        - the session id is unknown,
         - the session log file doesn't exist,
         - no anchor (matching prompt or session event) can be located,
         - reading the file fails.
         """
-        session_id = _extract_session_id(transcript)
         if not session_id:
             return {}
         session_log = (
@@ -508,6 +544,7 @@ class OpenClawRunner:
         screenshots: int,
         parse_warnings: int,
         tool_calls: dict[str, int] | None = None,
+        session_id: str | None = None,
     ) -> RunResult:
         """Build a RunResult, persisting the transcript first when enabled.
 
@@ -551,6 +588,7 @@ class OpenClawRunner:
             parse_warnings=parse_warnings,
             transcript_path=transcript_path,
             tool_calls=tool_calls or {},
+            session_id=session_id,
         )
 
     @staticmethod

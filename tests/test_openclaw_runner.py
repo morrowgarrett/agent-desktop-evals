@@ -515,7 +515,11 @@ def test_openclaw_runner_uses_agent_subcommand(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
     """Runner must invoke `openclaw agent --agent <id> --local --message <prompt> --json`,
-    not the nonexistent `chat --print --json`."""
+    not the nonexistent `chat --print --json`. Must also include a fresh
+    `--session-id <uuid4>` to prevent context contamination across runs."""
+    import re
+    import uuid as _uuid
+
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
     OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
     agent_call_args = mock_run.call_args_list[0].args[0]
@@ -528,32 +532,140 @@ def test_openclaw_runner_uses_agent_subcommand(
     # Old wrong invocation should be absent
     assert "chat" not in agent_call_args
     assert "--print" not in agent_call_args
+    # Session contamination fix: --session-id must be present with a UUID4 value
+    assert "--session-id" in agent_call_args, (
+        f"missing --session-id flag: {agent_call_args!r}"
+    )
+    sid_value = agent_call_args[agent_call_args.index("--session-id") + 1]
+    # Shape check (UUID-shaped 36-char string with hyphens)
+    assert re.match(
+        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+        sid_value,
+    ), f"--session-id value not UUID-shaped: {sid_value!r}"
+    # Parseability check (must be a real UUID4)
+    parsed = _uuid.UUID(sid_value)
+    assert parsed.version == 4, f"--session-id must be UUID4, got version {parsed.version}"
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_passes_agent_flag_default_main(
+def test_openclaw_runner_generates_unique_session_id_per_run(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
-    """OpenClaw bails without --agent; runner must default to 'main' (the user's default agent)."""
+    """Two consecutive runs of the same scenario must use different session IDs.
+
+    OpenClaw's `agent --agent main` reuses the persistent session for the named
+    agent, accumulating context across runs. Passing a fresh `--session-id` per
+    run prevents this. session_id is also stored on RunResult for traceability.
+    """
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="", stderr=""),  # agent #1
+        MagicMock(returncode=0, stdout="", stderr=""),  # check #1
+        MagicMock(returncode=0, stdout="", stderr=""),  # agent #2
+        MagicMock(returncode=0, stdout="", stderr=""),  # check #2
+    ]
+    runner = OpenClawRunner(transcript_dir=None)
+    scenario = Scenario.load(scenario_dir)
+    r1 = runner.run(scenario, mode=Mode.AUGMENTED)
+    r2 = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    # Extract session-id from each agent invocation argv
+    argv1 = mock_run.call_args_list[0].args[0]
+    argv2 = mock_run.call_args_list[2].args[0]
+    sid1 = argv1[argv1.index("--session-id") + 1]
+    sid2 = argv2[argv2.index("--session-id") + 1]
+    assert sid1 != sid2, f"session IDs must differ: {sid1} == {sid2}"
+    assert r1.session_id == sid1
+    assert r2.session_id == sid2
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_session_id_is_uuid4(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """The generated session_id is a parseable UUID4."""
+    import uuid
+
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(transcript_dir=None)
+    result = runner.run(Scenario.load(scenario_dir), mode=Mode.BASELINE)
+    assert result.session_id is not None
+    parsed = uuid.UUID(result.session_id)
+    assert parsed.version == 4
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_does_not_pass_agent_flag(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """Runner must NOT pass --agent to OpenClaw (verified empirically against
+    OpenClaw 2026.4.9 on 2026-04-18: --agent wins for session routing even when
+    --session-id is also passed, defeating context-isolation per run). The
+    runner relies on --session-id alone, which OpenClaw still resolves to the
+    default agent's provider/model and writes the session log under the
+    `main` agent's namespace.
+    """
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
     OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
     agent_args = mock_run.call_args_list[0].args[0]
-    assert "--agent" in agent_args, f"missing --agent flag: {agent_args!r}"
-    # --agent must be immediately followed by the agent id
-    assert agent_args[agent_args.index("--agent") + 1] == "main"
+    assert "--agent" not in agent_args, (
+        f"--agent must NOT be passed (causes session reuse); got {agent_args!r}"
+    )
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
-def test_openclaw_runner_agent_id_is_configurable(
-    mock_run, scenario_dir: Path, fake_openclaw_on_path
+def test_openclaw_runner_agent_id_used_for_session_log_lookup_only(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
 ):
-    """The --agent value must be configurable via constructor for non-default agents."""
-    mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
-    OpenClawRunner(agent_id="custom-agent").run(
-        Scenario.load(scenario_dir), mode=Mode.AUGMENTED
+    """The constructor's agent_id no longer reaches argv (see above); it is now
+    only used to locate the per-session JSONL under
+    ~/.openclaw/agents/<agent_id>/sessions/. This test pins that contract:
+    a custom agent_id resolves the lookup path, not the CLI flag.
+    """
+    sid = "test-sid-aaaa-bbbb-cccc-dddddddddddd"
+    session_root = tmp_path / "sessions"
+    sessions_dir = session_root / "custom-agent" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    log_file = sessions_dir / f"{sid}.jsonl"
+    scenario = Scenario.load(scenario_dir)
+    log_file.write_text(
+        json.dumps({"type": "session", "id": sid,
+                    "timestamp": "2026-04-19T00:00:00Z"}) + "\n"
+        + json.dumps({"type": "message", "id": "u1",
+                      "timestamp": "2026-04-19T00:00:01Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": scenario.prompt}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a1",
+                      "timestamp": "2026-04-19T00:00:02Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "t1", "name": "exec",
+                           "arguments": "..."}]}}) + "\n"
     )
+    # Force OpenClaw to "report" our test sid so the runner uses it.
+    fake_stdout = json.dumps({"meta": {"agentMeta": {
+        "sessionId": sid,
+        "usage": {"input": 1, "output": 1, "total": 2},
+    }}})
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout=fake_stdout, stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(
+        agent_id="custom-agent",
+        openclaw_session_root=session_root,
+        transcript_dir=None,
+    )
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+
+    # CLI flag absent regardless of constructor agent_id.
     agent_args = mock_run.call_args_list[0].args[0]
-    assert agent_args[agent_args.index("--agent") + 1] == "custom-agent"
+    assert "--agent" not in agent_args
+    # But the lookup path used custom-agent — the tool call resolved.
+    assert result.tool_calls == {"exec": 1}, (
+        f"agent_id must still drive session-log lookup path; got {result.tool_calls}"
+    )
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
