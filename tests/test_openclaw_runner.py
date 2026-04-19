@@ -969,6 +969,75 @@ def test_runner_default_tool_calls_empty_when_no_introspection(
     assert result.tool_calls == {}
 
 
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_runner_uses_prompt_anchor_to_isolate_current_run(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """The runner must pass scenario.prompt through to the session-log parser
+    so prior runs in the same append-only file aren't double-counted.
+
+    Without prompt anchoring this would return exec:5 (3 old + 2 new). With
+    prompt anchoring it returns exec:2 — only the current run's calls.
+    """
+    sid = "single-session-anchor"
+    session_root = tmp_path / "sessions"
+    sessions_dir = session_root / "main" / "sessions"
+    sessions_dir.mkdir(parents=True)
+    log_file = sessions_dir / f"{sid}.jsonl"
+    # The prompt the runner sends is scenario.prompt — load it from the fixture.
+    scenario = Scenario.load(scenario_dir)
+    log_file.write_text(
+        json.dumps({"type": "session", "id": sid,
+                    "timestamp": "2026-04-09T00:00:00Z"}) + "\n"
+        # OLD run with a different prompt — must NOT be counted.
+        + json.dumps({"type": "message", "id": "u_old",
+                      "timestamp": "2026-04-09T00:00:01Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "old prompt unrelated"}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a_old",
+                      "timestamp": "2026-04-09T00:00:02Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "old1", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "old2", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "old3", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+        # CURRENT run with scenario.prompt verbatim.
+        + json.dumps({"type": "message", "id": "u_new",
+                      "timestamp": "2026-04-19T00:00:00Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": scenario.prompt}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a_new",
+                      "timestamp": "2026-04-19T00:00:01Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "new1", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "new2", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+    )
+    fake_stdout = json.dumps({"meta": {"agentMeta": {
+        "sessionId": sid,
+        "usage": {"input": 1, "output": 1, "total": 2},
+    }}})
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout=fake_stdout, stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(
+        agent_id="main",
+        openclaw_session_root=session_root,
+        transcript_dir=None,
+    )
+    result = runner.run(scenario, mode=Mode.AUGMENTED)
+    assert result.tool_calls == {"exec": 2}, (
+        f"prompt anchoring must scope to current run only; got {result.tool_calls}. "
+        f"Without anchoring this would be 5 (3 old + 2 new)."
+    )
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell-out")
 def test_real_subprocess_with_invalid_utf8_does_not_crash(scenario_dir: Path, tmp_path: Path):
     """Replaces the prior mock-only UnicodeDecodeError test, which couldn't

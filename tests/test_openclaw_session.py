@@ -179,3 +179,141 @@ def test_extract_tool_calls_multiple_calls_same_tool(tmp_path: Path):
     )
     result = extract_tool_calls(fixture, session_id="s1")
     assert result == {"exec": 4}, f"got {result}"
+
+
+# --- prompt-anchor tests (the primary code path) ---
+
+
+def test_prompt_anchor_isolates_current_run_from_prior_runs(tmp_path: Path):
+    """Critical correctness: real OpenClaw appends multiple runs to the same
+    file with no fresh session event. Anchor on the prompt event of THIS run
+    so we don't fold prior runs' tool calls into the current count.
+
+    Verified behavior on real session log fccffb21-... showed 183 cumulative
+    exec calls from a session anchor that should have shown 4 for the latest
+    run. Prompt anchoring fixes that.
+    """
+    fixture = tmp_path / "session.jsonl"
+    fixture.write_text(
+        # Single session-creation event ever (real OpenClaw behavior).
+        json.dumps({"type": "session", "id": "agent-sess",
+                    "timestamp": "2026-04-09T00:00:00Z"}) + "\n"
+        # Run #1 (old, must NOT be counted).
+        + json.dumps({"type": "message", "id": "u_old",
+                      "timestamp": "2026-04-09T00:00:01Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "old prompt"}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a_old",
+                      "timestamp": "2026-04-09T00:00:02Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "old1", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "old2", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "old3", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+        # Run #2 (current).
+        + json.dumps({"type": "message", "id": "u_new",
+                      "timestamp": "2026-04-19T00:00:00Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "current prompt"}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a_new",
+                      "timestamp": "2026-04-19T00:00:01Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "new1", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+    )
+    result = extract_tool_calls(
+        fixture, session_id="agent-sess", prompt="current prompt",
+    )
+    assert result == {"exec": 1}, (
+        f"prompt anchor must scope to current run only; got {result} "
+        f"(without prompt anchoring this would be exec:4)"
+    )
+
+
+def test_prompt_anchor_uses_last_match_when_prompt_repeats(tmp_path: Path):
+    """If the same prompt was used in multiple prior runs (re-runs of the
+    same scenario), anchor on the LAST occurrence — the most recent run."""
+    fixture = tmp_path / "session.jsonl"
+    fixture.write_text(
+        json.dumps({"type": "session", "id": "s1",
+                    "timestamp": "2026-04-09T00:00:00Z"}) + "\n"
+        # First run with the prompt.
+        + json.dumps({"type": "message", "id": "u1",
+                      "timestamp": "2026-04-09T00:00:01Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "the prompt"}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a1",
+                      "timestamp": "2026-04-09T00:00:02Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "x1", "name": "exec",
+                           "arguments": "..."},
+                          {"type": "toolCall", "id": "x2", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+        # Second run with the SAME prompt.
+        + json.dumps({"type": "message", "id": "u2",
+                      "timestamp": "2026-04-19T00:00:00Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "the prompt"}]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a2",
+                      "timestamp": "2026-04-19T00:00:01Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "y1", "name": "read",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+    )
+    result = extract_tool_calls(fixture, session_id="s1", prompt="the prompt")
+    assert result == {"read": 1}, (
+        f"must anchor on LAST matching prompt (most recent run); got {result}"
+    )
+
+
+def test_prompt_anchor_falls_back_to_session_event_when_no_match(tmp_path: Path):
+    """When the prompt isn't present in the file (e.g., the agent crashed
+    before writing the user event), fall back to the session-creation event
+    rather than returning empty. Imperfect but better than nothing."""
+    fixture = tmp_path / "session.jsonl"
+    fixture.write_text(
+        json.dumps({"type": "session", "id": "s1",
+                    "timestamp": "2026-04-09T00:00:00Z"}) + "\n"
+        + json.dumps({"type": "message", "id": "a1",
+                      "timestamp": "2026-04-09T00:00:01Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "1", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+    )
+    result = extract_tool_calls(
+        fixture, session_id="s1", prompt="never appeared in log",
+    )
+    assert result == {"exec": 1}, (
+        f"missing prompt match should fall back to session anchor; got {result}"
+    )
+
+
+def test_prompt_anchor_joins_multi_block_user_content(tmp_path: Path):
+    """User content can be multiple text blocks concatenated. The matcher
+    must join them before comparing to the prompt."""
+    fixture = tmp_path / "session.jsonl"
+    fixture.write_text(
+        json.dumps({"type": "session", "id": "s1",
+                    "timestamp": "2026-04-19T00:00:00Z"}) + "\n"
+        + json.dumps({"type": "message", "id": "u1",
+                      "timestamp": "2026-04-19T00:00:01Z",
+                      "message": {"role": "user", "content": [
+                          {"type": "text", "text": "hello "},
+                          {"type": "text", "text": "world"},
+                      ]}}) + "\n"
+        + json.dumps({"type": "message", "id": "a1",
+                      "timestamp": "2026-04-19T00:00:02Z",
+                      "message": {"role": "assistant", "content": [
+                          {"type": "toolCall", "id": "1", "name": "exec",
+                           "arguments": "..."},
+                      ]}}) + "\n"
+    )
+    result = extract_tool_calls(fixture, session_id="s1", prompt="hello world")
+    assert result == {"exec": 1}, f"got {result}"

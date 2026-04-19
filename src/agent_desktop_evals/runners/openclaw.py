@@ -418,7 +418,7 @@ class OpenClawRunner:
         # sessionId we can use to anchor reads in the per-session JSONL.
         # Failed-agent runs may still expose sessionId — try anyway so failure
         # transcripts carry tool-call evidence when available.
-        tool_calls = self._read_tool_calls(transcript)
+        tool_calls = self._read_tool_calls(transcript, scenario.prompt)
 
         # Even if check_state would pass, a failed agent invocation must not be
         # reported as success: a leftover desktop state from a prior run could
@@ -470,13 +470,17 @@ class OpenClawRunner:
             tool_calls=tool_calls,
         )
 
-    def _read_tool_calls(self, transcript: str) -> dict[str, int]:
+    def _read_tool_calls(self, transcript: str, prompt: str) -> dict[str, int]:
         """Extract per-tool invocation counts from the OpenClaw session log.
 
-        Returns an empty dict (without crashing) whenever:
+        Passes both the sessionId (resolves the file path) and the prompt
+        (anchors which run's events to count, since OpenClaw appends multiple
+        runs into the same session file). Returns an empty dict (without
+        crashing) whenever:
+
         - OpenClaw output didn't expose a sessionId,
         - the session log file doesn't exist,
-        - the session anchor can't be located in the file,
+        - no anchor (matching prompt or session event) can be located,
         - reading the file fails.
         """
         session_id = _extract_session_id(transcript)
@@ -485,7 +489,7 @@ class OpenClawRunner:
         session_log = (
             self._session_root / self._agent_id / "sessions" / f"{session_id}.jsonl"
         )
-        return extract_tool_calls(session_log, session_id)
+        return extract_tool_calls(session_log, session_id, prompt=prompt)
 
     def _finalize(
         self,
