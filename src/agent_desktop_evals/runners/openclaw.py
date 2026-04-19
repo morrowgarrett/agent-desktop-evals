@@ -217,13 +217,21 @@ class OpenClawRunner:
 
     @staticmethod
     def _strip_agent_desktop(path: str) -> str:
-        """Remove any PATH entry that contains an executable agent-desktop binary."""
+        """Remove PATH entries that resolve agent-desktop to an executable.
+
+        Preserves empty segments verbatim: on POSIX, an empty PATH entry
+        (leading/trailing/double colon) means 'current directory' and dropping
+        it changes command-resolution semantics rather than just removing
+        agent-desktop. Uses shutil.which for the executable check so this
+        agrees with env.has_agent_desktop_on_path (a directory named
+        'agent-desktop' is not an executable and must not trigger a strip).
+        """
         kept: list[str] = []
         for d in path.split(os.pathsep):
-            if not d:
-                continue
-            candidate = Path(d, "agent-desktop")
-            if candidate.exists() and os.access(candidate, os.X_OK):
+            # shutil.which("agent-desktop", path="") is undefined; the empty
+            # segment carries POSIX 'current directory' meaning and we keep it
+            # verbatim without performing the executable check.
+            if d and shutil.which("agent-desktop", path=d) is not None:
                 continue
             kept.append(d)
         return os.pathsep.join(kept)

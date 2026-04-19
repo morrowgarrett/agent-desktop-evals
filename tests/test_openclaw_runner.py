@@ -117,6 +117,37 @@ def test_strip_agent_desktop_skips_empty_segments():
     assert "/bin" in result
 
 
+def test_strip_agent_desktop_preserves_leading_empty_segment():
+    """POSIX: leading colon means current dir; must not be dropped."""
+    result = OpenClawRunner._strip_agent_desktop(":/usr/bin:/bin")
+    assert result.startswith(":"), (
+        f"expected leading empty segment preserved, got {result!r}"
+    )
+
+
+def test_strip_agent_desktop_preserves_trailing_empty_segment():
+    result = OpenClawRunner._strip_agent_desktop("/usr/bin:/bin:")
+    assert result.endswith(":"), (
+        f"expected trailing empty segment preserved, got {result!r}"
+    )
+
+
+def test_strip_agent_desktop_preserves_double_colon():
+    result = OpenClawRunner._strip_agent_desktop("/usr/bin::/bin")
+    assert "::" in result, f"expected '::' preserved, got {result!r}"
+
+
+def test_strip_agent_desktop_uses_executable_check_not_path_exists(tmp_path: Path):
+    """A directory named 'agent-desktop' should NOT cause the parent to be stripped."""
+    parent = tmp_path / "with_dir_named_agent_desktop"
+    parent.mkdir()
+    (parent / "agent-desktop").mkdir()  # directory, not file
+    result = OpenClawRunner._strip_agent_desktop(str(parent))
+    assert str(parent) in result, (
+        f"directory named 'agent-desktop' should not trigger strip; got {result!r}"
+    )
+
+
 # --- OpenClawRunner.run tests (mocked subprocess) ---
 
 
