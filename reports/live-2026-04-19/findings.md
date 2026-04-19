@@ -1,94 +1,70 @@
 # Scenario A — first paired live run (2026-04-19)
 
-## Headline result
+> **Status: this is a single n=1 paired run with documented methodology gaps. NOT writeup-ready.** A second adversarial review surfaced multiple unsupported claims in an earlier draft of this file. This version is the corrected, claims-restricted record. The empirical work to support a public writeup is tracked as M1.5 (see "What's missing for writeup-readiness" below).
 
-Both modes succeeded. Augmented was **15% faster** but consumed **5.8% more tokens**. Both modes used **0 screenshots**, indicating both agents bypassed the GUI entirely and went straight to `gsettings set` via shell exec.
+## Raw observations (the only things we can defend)
 
-| metric | baseline | augmented | delta |
-|--------|----------|-----------|-------|
-| tokens | 152,231 | 160,998 | +5.8% |
-| wallclock (s) | 71.39 | 60.47 | −15.3% |
-| screenshots | 0 | 0 | — |
-| success | ✓ | ✓ | — |
-| parse_warnings | 1 | 0 | — |
+| metric | baseline | augmented |
+|--------|----------|-----------|
+| `meta.agentMeta.usage.total` (the bench's `tokens` field) | 152,231 | 160,998 |
+| wall-clock seconds | 71.39 | 60.47 |
+| screenshots | 0 (see methodology gap below) | 0 (see methodology gap below) |
+| success per `check_state.sh` | ✓ | ✓ |
+| `parse_warnings` | 1 | 0 |
+| Background color before | `'#023c88'` | `'#023c88'` |
+| Background color after | `'#202124'` | `'#5a2a7a'` |
 
-## Critical finding: scenario A is not a useful differentiator
+The two runs used different scenario IDs (`a-gnome-settings` and `a-gnome-settings-augmented`), so the bench's paired-comparison code path didn't fire. The table above was hand-typed from the two single-mode reports. The bench's `render_markdown` paired-delta logic remains **untested in production**.
 
-The scenario asked the agent to "open GNOME Settings, change the Background to a different solid color." Both agents skipped the GUI entirely and called `gsettings set org.gnome.desktop.background primary-color '<value>'` via the OpenClaw `exec` tool. The check script verified the gsettings value changed — which it had — so both runs registered as success.
+## What this run does NOT tell us
 
-**The scenario design assumed the agent would attempt the GUI path.** OpenClaw's main agent has a `gpt-5.4` brain that recognized the CLI shortcut immediately. Result: scenario A doesn't measure what we built it to measure (a11y-tree-driven GUI control vs vision-driven GUI control).
+- **Which tools either agent used.** The bench parser doesn't capture per-tool-call counts. `screenshots = 0` is a placeholder default (the parser has a TODO at `runners/openclaw.py` line ~122 noting screenshot detection is stubbed). Both runs' raw stdout/stderr were not persisted to disk — only the bench's one-line summary survived. We do not know whether the agent (a) opened gnome-control-center, (b) called `gsettings set` via `exec`, (c) invoked `agent-desktop interact`, or (d) some combination. **Any prior phrasing in this file or HANDOFF claiming "agents bypassed the GUI" was inferred from a placeholder and should be discarded.**
+- **Whether the augmented prompt actually exercised agent-desktop.** Same gap as above. The SKILL.md was prepended to the prompt, but we can't observe whether the agent invoked any agent-desktop subcommand.
+- **Whether the token delta is meaningful.** `meta.agentMeta.usage.total = input + output + cacheRead + cacheWrite`. The smoke-fixture data the parser was modeled on had `cacheRead` at ~97% of `total`. With one run each, no per-component breakdown captured, and OpenClaw cache state varying across runs, the +5.8% delta could be SKILL.md input cost, response-length variance, cache-state difference, or any combination. We can't attribute it.
+- **Whether augmented is meaningfully faster than baseline.** With n=1 each and OpenClaw API-call wall-clock varying ±10-20s plausibly, the 11s delta is well within the noise envelope. The earlier draft's "15% faster" headline was statistical garbage. Actual signal requires N≥5 paired runs.
+- **What field triggered baseline's `parse_warnings=1`.** The C-C drift detector fires when an unknown field appears in `meta.agentMeta.usage`. We didn't capture the raw transcript, so we cannot identify the field post-facto. The detector's diagnostic value is undermined by not persisting transcripts.
+- **Whether the AT-SPI Linux/Wayland horror story we documented in the design doc is real.** The agent never (so far as we know) tried to open gnome-control-center via AT-SPI, so the failure modes around GTK4 a11y degeneracy / wtype / ydotool / sway-only focus were not exercised. The plan said GNOME/X11; we ran on GNOME/Wayland — the whole point of specifying X11 was to enable the input-simulation paths the SKILL.md describes. We didn't reach those paths regardless, so the X11 vs Wayland choice didn't matter for THIS run, but only by accident.
 
-This is good empirical signal for the eval format — but it means scenario A's numbers aren't comparable to the original Phase 2 plan's intent.
+## Methodology gaps to fix before the next run (the M1.5 backlog)
 
-## What this means for Phase 2 scenario design
+1. **Persist raw stdout/stderr to disk** when running. Either always (gitignored) or at minimum when `parse_warnings > 0`. Without this, drift detection is unactionable and tool-use auditing is impossible.
+2. **Capture per-tool-call counts** in the parser. Beyond `screenshots`, also at least: count of `exec` calls, count of `agent-desktop` shell-outs (detectable by argv prefix), count of distinct tool names invoked. Replace the placeholder `screenshots = 0` with real measurement.
+3. **Refactor scenario architecture so paired mode runs share a single scenario ID.** Current fork pattern (`a-gnome-settings` + `a-gnome-settings-augmented` as separate directories) means the bench's paired-comparison code path is unused. Options: per-mode prompt overrides in scenario.toml, or a separate "augmentation" config layer.
+4. **Run N≥5 paired iterations** before any quantitative claim. Statistical signal floor.
+5. **Decide and document** the augmented-prompt strategy. Current SKILL.md text includes "❌ File operations — use shell tools instead" — that actively routes the agent away from AT-SPI for state-mutation tasks like setting a dconf key. If the goal is "force AT-SPI exercise," the prompt should explicitly require it. If the goal is "let the agent pick," the experiment is about agent judgment, not scenario validity. Pick one and acknowledge in the scenario design doc.
+6. **Run on GNOME/X11** (per the M1 plan's explicit specification) so the AT-SPI path the SKILL.md describes is actually reachable. The current Wayland run is a deviation from plan.
+7. **Author `docs/SCENARIO-DESIGN.md`** documenting the "scenarios that have a CLI shortcut won't differentiate baseline-vs-augmented" constraint. Future scenarios must be CLI-unrouteable for the experiment to mean anything.
 
-Future scenarios must be **CLI-unrouteable**. The agent must have NO shell shortcut. Candidates:
+## What this run DOES tell us (limited but real)
 
-- **GUI dialogs with no API**: a vendor-specific About dialog, an app-specific settings panel that doesn't expose dconf/gsettings keys, native chat UI compose-and-send (where `$CLI send` doesn't exist for the chosen client).
-- **Information extraction from a window**: read a value visible in a GUI that isn't queryable via shell (e.g., a real-time graph value, a dialog message).
-- **Stateful UI navigation**: navigate a multi-step wizard / setup flow that requires sequenced clicks.
+- **The bench harness end-to-end pipeline runs.** OpenClaw subprocess, `--agent main` selection, JSON parsing, check_state invocation, RunResult emission, report rendering, CSV emission — all worked against real OpenClaw 2026.4.9 output without crashing.
+- **OpenClaw `agent --local --message <prompt> --json` is a viable interface for one-shot non-interactive runs.** The smoke-fixture-based parser (`meta.agentMeta.usage.total`) extracted real values from real production output.
+- **Both modes succeeded** at producing a state change observable by `check_state.sh`. Whether by GUI or by shell, the scenario completed.
+- **The C-C drift detector fired** on a real production output (baseline). The detector's existence is validated; its actionability isn't (per gap #1).
+- **Wallclock for one OpenClaw `agent --local` invocation against this prompt + this model + this network** is on the order of 60-72s. Useful planning data for future runs.
 
-Document this constraint in `docs/SCENARIO-DESIGN.md` (TODO) before authoring B/C/D in M2.
+## M1 acceptance — honest revision
 
-## Augmented vs baseline behavior breakdown
+The earlier draft of this file claimed "M1 fully closed: 9 of 9." That was premature. Honest count:
 
-Both runs consumed roughly the same baseline (cumulative) tokens:
-- Baseline: 152,231 tokens
-- Augmented: 160,998 tokens  (Δ +8,767)
+| check | true status |
+|-------|-------------|
+| Bench repo public, CI green | ✓ |
+| Stub runner works | ✓ |
+| OpenClaw runner: baseline mode runs | ✓ but on Wayland not the planned X11; tool-use not captured |
+| OpenClaw runner: augmented mode runs | ✓ but same caveats; AT-SPI paths not demonstrably exercised |
+| Paired comparison report | ✗ — bench's paired-mode code path was NOT exercised. The two runs used different scenario IDs; the comparison table in this doc was hand-typed |
+| SKILL.md drafted + PR'd (#22) | ✓ |
+| Issue #21 filed | ✓ |
+| Format-flip PR'd (#23) | ✓ |
+| HANDOFF | ✓ but reflected the over-claim and was updated separately |
 
-The +8,767 token delta in augmented corresponds almost exactly to the SKILL.md content prepended to the augmented prompt (~9KB / ~3K tokens at typical encoding) plus the agent's slightly longer reasoning trace about "do I need this tool or not?"
+**Realistic M1 status: 6 of 9 fully met; 2 met-with-caveats (single-mode runs each succeeded but the SKILL.md value proposition is uncharacterized); 1 not met (paired report).** M1.5 is needed to actually deliver the empirical artifact the design doc framed.
 
-Wall-clock: augmented was 11s faster (71.4s → 60.5s). One run each — could be variance. Plausible interpretation: the agent in augmented mode had explicit guidance about its options and decided faster. Need 5+ runs each to claim significance.
+## Files
 
-## Parse warning (baseline only)
-
-Baseline run reported `parse_warnings=1` from the bench's metric parser. Likely the C-C drift detector (introduced in commit `34dfa31`) firing on an unknown field in OpenClaw's `usage` block — exactly its purpose. Worth a follow-up to identify the exact field for documentation.
-
-Augmented run: 0 warnings. Same parser, same OpenClaw version, same model — the warning may not be deterministic. Worth investigating.
-
-## Validation of the bench harness
-
-| validation | outcome |
-|------------|---------|
-| OpenClaw subcommand correct (`agent --local --message --json`) | ✓ |
-| `--agent main` flag works | ✓ |
-| Stderr+stdout combined parsing works against real output | ✓ |
-| `meta.agentMeta.usage.total` extraction correct (152K / 161K not 119) | ✓ |
-| Last-cumulative-wins (single object today, not exercised) | not exercised |
-| Agent exit-code gate fired correctly (proc.returncode=0 → success allowed through) | ✓ |
-| check_state correctly verified gsettings change | ✓ |
-| Drift detector fired once (real upstream field unknown to our model) | ✓ |
-| ydotool/wtype/sway issues | not exercised (agent skipped GUI) |
-| AT-SPI tree degeneracy issues | not exercised (agent skipped GUI) |
-
-The Linux/Wayland horror story we documented in the design doc was completely bypassed because the agent never tried the GUI. **The scenario didn't force the agent into the AT-SPI path.**
-
-## Acceptance criteria status (M1 plan)
-
-- [x] Bench repo public, CI green
-- [x] Stub runner works
-- [x] OpenClaw runner: baseline mode (real run, success)
-- [x] OpenClaw runner: augmented mode (real run, success)
-- [x] Paired report + comparison
-- [x] SKILL.md drafted + PR'd (#22)
-- [x] Issue #21 filed
-- [x] Format-flip PR'd (#23)
-- [x] HANDOFF updated
-
-**M1 fully closed.**
-
-## Action items / follow-ups
-
-1. Investigate the baseline-only `parse_warnings=1`. Re-run both modes 3–5× to check determinism.
-2. Author `docs/SCENARIO-DESIGN.md` documenting the "no CLI shortcut" requirement before M2 scenarios B/C/D.
-3. Consider adding `--no-shell` or "GUI required" annotation to scenario format so future agents are forced into the visual path.
-4. Surface `parse_warnings` in the markdown/CSV reports (M-B from prior review — out of scope for M1, deferred).
-5. Capture a multi-turn fixture (the smoke fixture is single-turn, so the C-A "last cumulative wins" code path isn't exercised by tests against real data yet).
-
-## Repo state
-
-- HEAD: `34dfa31` (8th commit, all review fixes landed)
-- 63 tests passing
-- CI green
-- Reports at `reports/live-2026-04-19/{baseline,augmented}/{report.md,report.csv}`
-- Augmented scenario fork at `scenarios/a-gnome-settings-augmented/` (manual one-off; productize in M2)
+- Reports: `reports/live-2026-04-19/{baseline,augmented}/{report.md,report.csv}`
+- Augmented scenario fork: `scenarios/a-gnome-settings-augmented/` (acknowledged hack; productize per gap #3)
+- Bench HEAD at run time: `34dfa31`
+- Tests passing: 63
+- CI: green
