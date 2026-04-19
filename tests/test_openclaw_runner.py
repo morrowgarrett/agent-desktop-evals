@@ -50,7 +50,9 @@ def test_strip_agent_desktop_removes_dirs_with_binary(tmp_path: Path):
     a.mkdir()
     b = tmp_path / "b"
     b.mkdir()
-    (b / "agent-desktop").touch()
+    fake_bin = b / "agent-desktop"
+    fake_bin.touch()
+    fake_bin.chmod(0o755)
     result = OpenClawRunner._strip_agent_desktop(f"{a}:{b}:/usr/bin")
     assert str(a) in result
     assert str(b) not in result
@@ -122,7 +124,9 @@ def test_openclaw_runner_baseline_strips_agent_desktop_from_path(
     # Set up a fake PATH with one dir containing agent-desktop and one without
     has_ad = tmp_path / "with_ad"
     has_ad.mkdir()
-    (has_ad / "agent-desktop").touch()
+    fake_ad = has_ad / "agent-desktop"
+    fake_ad.touch()
+    fake_ad.chmod(0o755)
     no_ad = tmp_path / "without_ad"
     no_ad.mkdir()
     monkeypatch.setenv("PATH", f"{has_ad}:{no_ad}")
@@ -145,7 +149,9 @@ def test_openclaw_runner_augmented_keeps_path_intact(
     """AUGMENTED mode must NOT strip PATH."""
     has_ad = tmp_path / "with_ad"
     has_ad.mkdir()
-    (has_ad / "agent-desktop").touch()
+    fake_ad = has_ad / "agent-desktop"
+    fake_ad.touch()
+    fake_ad.chmod(0o755)
     monkeypatch.setenv("PATH", str(has_ad))
 
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]

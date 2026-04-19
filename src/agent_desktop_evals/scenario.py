@@ -56,7 +56,27 @@ class Scenario(BaseModel):
                 f"scenario.toml id {parsed.id!r} must match directory name {directory.name!r}"
             )
 
+        # Validate check.script is a safe relative path (no absolute, no traversal).
+        script_path = Path(parsed.check.script)
+        if script_path.is_absolute():
+            raise ScenarioError(
+                f"check.script must be a relative path, got absolute: {parsed.check.script!r}"
+            )
+        if ".." in script_path.parts:
+            raise ScenarioError(
+                f"check.script must not contain '..' segments: {parsed.check.script!r}"
+            )
+
         check_script = directory / parsed.check.script
+        # Defence in depth: ensure the resolved path stays inside the scenario dir.
+        resolved_dir = directory.resolve()
+        resolved_script = check_script.resolve()
+        try:
+            resolved_script.relative_to(resolved_dir)
+        except ValueError as e:
+            raise ScenarioError(
+                f"check.script resolves outside scenario directory: {parsed.check.script!r}"
+            ) from e
         if not check_script.exists():
             raise ScenarioError(f"missing check script: {check_script}")
 

@@ -43,3 +43,29 @@ def test_id_must_match_directory_name(scenario_dir: Path):
     )
     with pytest.raises(ScenarioError, match=r"id .* must match"):
         Scenario.load(scenario_dir)
+
+
+def test_check_script_rejects_absolute_path(scenario_dir: Path):
+    """check.script must be a relative path within the scenario directory."""
+    (scenario_dir / "scenario.toml").write_text(
+        'id = "minimal-scenario"\n'
+        'title = "X"\n'
+        'target_app = "x"\n'
+        'timeout_seconds = 1\n'
+        '[check]\nscript = "/etc/passwd"\nexpect_exit_code = 0\n'
+    )
+    with pytest.raises(ScenarioError, match=r"check\.script"):
+        Scenario.load(scenario_dir)
+
+
+def test_check_script_rejects_parent_traversal(scenario_dir: Path):
+    """check.script with '..' segments must be rejected."""
+    (scenario_dir / "scenario.toml").write_text(
+        'id = "minimal-scenario"\n'
+        'title = "X"\n'
+        'target_app = "x"\n'
+        'timeout_seconds = 1\n'
+        '[check]\nscript = "../foo.sh"\nexpect_exit_code = 0\n'
+    )
+    with pytest.raises(ScenarioError, match=r"check\.script"):
+        Scenario.load(scenario_dir)
