@@ -2,6 +2,8 @@
 
 > **Status: this is the first methodologically-clean paired run.** Pass-4 numbers are now known to be heavily distorted by session contamination (G2 from prior findings); pass-5 uses the G2 fix (`--session-id $(uuidgen)` per run, commit `745eab1`).
 
+> **Token-count correction (2026-04-19):** the originally reported pass-5 token counts (22,994 / 21,967) were wrong by ~12×. Root cause: OpenClaw's `meta.agentMeta.usage.total` is overwritten per call (matches `lastCallUsage.total`) rather than accumulated across turns; the bench's `_tokens_from_usage` was preferring `total` over the cumulative `input/output/cacheRead/cacheWrite` sum. Fixed in `fix(runner): always sum cumulative usage components (do not trust usage.total)`. Numbers below have been re-derived from the persisted transcripts in `reports/raw/b-libreoffice-write/{baseline,augmented}/`.
+
 ## Headline result
 
 Both modes succeeded via the same `libreoffice --headless --convert-to` shell fallback. Both ATTEMPTED `agent-desktop` substantively (observe + interact/type calls). **Both got blocked by issue #24 (AT-SPI window focus gated behind sway-only on Mutter Wayland)** and fell back to shell.
@@ -10,7 +12,8 @@ The clean-session data tells a different story than pass-4:
 
 | metric | baseline pass-5 | augmented pass-5 | delta |
 |--------|-----------------|------------------|-------|
-| tokens (cumulative for this session) | 22,994 | 21,967 | −4.5% |
+| tokens (cumulative billable, corrected) | 273,800 | 266,708 | −2.6% |
+| tokens (originally reported, now known wrong) | 22,994 | 21,967 | −4.5% |
 | wallclock (s) | 97.79 | 103.80 | +6.1% |
 | total tool calls | 21 | 16 | −24% |
 | `read` calls (orientation) | 7 | 1 | −86% |
@@ -18,7 +21,7 @@ The clean-session data tells a different story than pass-4:
 | `process` calls | 0 | 2 | new |
 | `parse_warnings` | 3 | 0 | C-C detector firing on baseline |
 
-Augmented is 24% lower tool calls overall, mostly because it loaded less orientation context. **It is NOT faster, NOT cheaper in tokens, AND ran into the same Wayland blocker as baseline.**
+The corrected token numbers narrow the augmented-vs-baseline gap (−2.6% vs the formerly reported −4.5%); the difference is well inside single-run variance for OpenClaw API calls. Augmented is 24% lower tool calls overall, mostly because it loaded less orientation context. **It is NOT meaningfully cheaper in tokens, NOT faster, AND ran into the same Wayland blocker as baseline.**
 
 ## What both agents actually did (paraphrased traces)
 
@@ -53,18 +56,20 @@ Step 10 of augmented (`agent-desktop type --app soffice ...`) is the value-prop 
 
 ## Pass-4 vs pass-5 comparison (the cost of session contamination)
 
-The pass-4 numbers we previously celebrated were largely artifact:
+The pass-4 numbers we previously celebrated were largely artifact. Note that the pass-4 token counts here are themselves under-counted (same `usage.total` bug — see the correction note at the top); they remain comparable to each other within pass-4, but not directly to the corrected pass-5 sums:
 
-| | pass-4 (contaminated) | pass-5 (clean) | what changed |
-|---|---|---|---|
-| baseline tokens | 186,306 | 22,994 | pass-4 included accumulated cache from earlier same-session runs |
-| augmented tokens | 177,853 | 21,967 | same |
-| baseline tool calls | 7 | 21 | pass-4's agent had prior context; pass-5 has to discover everything |
-| augmented tool calls | 4 | 16 | same |
+| | pass-4 (contaminated, OLD formula) | pass-5 (clean, OLD formula) | pass-5 (clean, CORRECTED) | what changed |
+|---|---|---|---|---|
+| baseline tokens | 186,306 | 22,994 | 273,800 | pass-4 had accumulated state across runs; pass-5 is one fresh session; correction is the cumulative-components fix |
+| augmented tokens | 177,853 | 21,967 | 266,708 | same |
+| baseline tool calls | 7 | 21 | 21 | pass-4's agent had prior context; pass-5 has to discover everything |
+| augmented tool calls | 4 | 16 | 16 | same |
 
-The 88% drop in token counts confirms the C-C/cumulative-usage concern from the prior adversarial review: `meta.agentMeta.usage.total` is cumulative for the SESSION, not per-run. With the same session shared across days of runs, the cumulative count includes ALL the cache reads from prior runs — the metric was non-comparable across runs.
+Two distinct issues collided here:
+1. **G2 (session contamination, fixed by commit `745eab1`)**: pass-4 reused the same OpenClaw session across runs, so `usage.input/output/cacheRead` accumulated across days of work — making the metric non-comparable across runs.
+2. **F2 (token-formula bug, fixed in this commit)**: `_tokens_from_usage` preferred `usage.total`, which OpenClaw overwrites per call. Multi-turn runs reported the LAST call's billable, not the session's cumulative. Pass-5 (originally) reported 22,994 / 21,967 because every multi-turn run hit this; the true cumulative billable for those same fresh sessions is 273,800 / 266,708.
 
-Pass-5 is the FIRST run we can defensibly compare across modes (same session length both modes, both fresh).
+Pass-5 with the corrected formula is the FIRST run we can defensibly compare across modes (same session length both modes, both fresh, both correctly summed).
 
 ## Methodology gotchas remaining
 
@@ -80,7 +85,7 @@ To get a TRUE binary-absence baseline, we'd need to:
 
 ### G3 still holds: n=1
 
-One paired run. Tokens were within 4.5% of each other; wallclock within 6.1%. Both within plausible single-run variance for OpenClaw API calls. **Need N≥5 paired before any quantitative claim.**
+One paired run. Corrected tokens were within 2.6% of each other; wallclock within 6.1%. Both within plausible single-run variance for OpenClaw API calls. **Need N≥5 paired before any quantitative claim.**
 
 ### New: the C-C drift detector fired 3x in baseline, 0x in augmented
 

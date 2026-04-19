@@ -50,15 +50,21 @@ class _Usage(BaseModel):
 
 
 def _tokens_from_usage(usage: _Usage) -> int:
-    """Use the precomputed total when truthy; otherwise sum all four fields.
+    """Cumulative billable tokens across all turns of the session.
 
-    OpenClaw's createUsageAccumulator precomputes total = input+output+cacheRead+cacheWrite;
-    we prefer that over re-summing to avoid drift if the upstream definition changes.
-    Truthy (not 'is not None') so a buggy upstream emitting total=0 with nonzero
-    components self-heals to the component sum rather than reporting zero.
+    NOTE: usage.total is NOT cumulative — it overwrites per call (verified
+    against OpenClaw 2026.4.9 multi-turn pass-5 transcripts; usage.total
+    consistently equals lastCallUsage.total). The input/output/cacheRead/
+    cacheWrite fields ARE cumulative across turns (per
+    pi-embedded-Vw-lS5ti.js:32847 mergeUsageIntoAccumulator), so summing them
+    yields the true cumulative billable count.
+
+    Earlier formulation preferred usage.total as authoritative — that was
+    validated only against the 1-turn smoke fixture where total happens to
+    equal sum, and produced ~12x undercounts on multi-turn runs. The _Usage
+    .total field is preserved (still emitted by OpenClaw, useful for per-call
+    cost analysis if needed later) but is no longer consulted here.
     """
-    if usage.total:
-        return usage.total
     return usage.input + usage.output + usage.cacheRead + usage.cacheWrite
 
 

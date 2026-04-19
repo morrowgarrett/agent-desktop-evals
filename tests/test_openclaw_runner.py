@@ -9,7 +9,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent_desktop_evals.runner_base import Mode, RunResult
-from agent_desktop_evals.runners.openclaw import OpenClawRunner, _parse_metrics
+from agent_desktop_evals.runners.openclaw import (
+    OpenClawRunner,
+    _parse_metrics,
+    _tokens_from_usage,
+    _Usage,
+)
 from agent_desktop_evals.scenario import Scenario
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures"
@@ -36,10 +41,13 @@ def test_parse_metrics_from_real_openclaw_output():
 
     Ground truth: tests/fixtures/openclaw-smoke-output.txt is a real run of
     `openclaw agent --agent main --local --message "Reply with just the word OK" --json`
-    captured from stderr. Token counts are at meta.agentMeta.usage.total
-    (the precomputed cumulative accumulator) in that fixture. Real value: 148727.
-    Previously the parser only summed input + output (= 119) and silently dropped
-    cacheRead and cacheWrite, undercounting by three orders of magnitude.
+    captured from stderr. Real cumulative billable tokens = input + output +
+    cacheRead + cacheWrite = 114 + 5 + 148608 + 0 = 148727.
+
+    Note: this is a 1-turn run, so usage.total (148727) happens to equal the
+    sum. On multi-turn runs usage.total is per-call (matches lastCallUsage.total)
+    while input/output/cacheRead/cacheWrite ARE cumulative — see
+    test_tokens_from_usage_uses_cumulative_components_not_total.
     """
     content = SMOKE_FIXTURE.read_text()
     result = _parse_metrics(content)
@@ -48,23 +56,70 @@ def test_parse_metrics_from_real_openclaw_output():
     assert result["parse_warnings"] == 0
 
 
-def test_parse_metrics_prefers_total_field():
-    """When 'total' is present in usage, use it as authoritative.
+def test_tokens_from_usage_uses_cumulative_components_not_total():
+    """Real multi-turn OpenClaw output has total != sum (total is per-call,
+    sum is cumulative). The bench must report cumulative billable tokens.
 
-    OpenClaw's createUsageAccumulator precomputes total = input+output+cacheRead+cacheWrite;
-    we prefer that over re-summing to avoid drift if the upstream definition changes.
+    Empirical evidence: pass-5 baseline transcript
+    (reports/raw/b-libreoffice-write/baseline/20260419-142538-7ae748a6.txt)
+    shows usage.total == lastCallUsage.total == 22994 (per-call), but the
+    cumulative usage.{input,output,cacheRead,cacheWrite} sums to 273,800 —
+    a ~12x undercount when relying on usage.total.
+    """
+    usage = _Usage(
+        input=35501, output=1883, cacheRead=236416, cacheWrite=0, total=22994
+    )
+    # Cumulative billable is the sum, NOT the per-call total.
+    assert _tokens_from_usage(usage) == 35501 + 1883 + 236416 + 0
+    assert _tokens_from_usage(usage) == 273800
+    assert _tokens_from_usage(usage) != 22994  # the buggy value
+
+
+def test_tokens_from_usage_smoke_fixture_still_correct():
+    """The smoke-fixture shape (1-turn, total == sum) still produces the same
+    answer because total agrees with sum in that case anyway."""
+    usage = _Usage(input=114, output=5, cacheRead=148608, cacheWrite=0, total=148727)
+    assert _tokens_from_usage(usage) == 148727  # both formulas give same answer for 1-turn
+
+
+def test_tokens_from_usage_ignores_total_when_diverges():
+    """Adversarial fixture where total is deliberately wrong; we should sum the
+    components."""
+    usage = _Usage(input=100, output=50, cacheRead=200, cacheWrite=0, total=999999)
+    assert _tokens_from_usage(usage) == 350  # NOT 999999
+
+
+def test_parse_metrics_real_fixture_full_token_count():
+    """The real smoke fixture has 148,727 cumulative tokens. Same answer
+    before and after the fix because it's a 1-turn run."""
+    fixture_path = Path(__file__).parent / "fixtures" / "openclaw-smoke-output.txt"
+    result = _parse_metrics(fixture_path.read_text())
+    assert result["tokens"] == 148727  # unchanged from before
+
+
+def test_parse_metrics_ignores_total_field_uses_sum_instead():
+    """Inverted from the prior 'prefers total' test: usage.total is per-call,
+    not cumulative, so we must always sum the cumulative components.
+
+    Adversarial: a fixture where the components sum to 148,727 but total is
+    a different number (simulating the multi-turn case). The parser must
+    return the sum, not the misleading total.
     """
     transcript = (
         '{"meta": {"agentMeta": {"usage": '
-        '{"input": 114, "output": 5, "cacheRead": 148608, "total": 148727}}}}'
+        '{"input": 114, "output": 5, "cacheRead": 148608, "cacheWrite": 0, '
+        '"total": 999}}}}'
     )
     result = _parse_metrics(transcript)
-    assert result["tokens"] == 148727, f"expected 148727, got {result}"
+    assert result["tokens"] == 148727, (
+        f"expected sum 148727, NOT per-call total 999, got {result}"
+    )
     assert result["parse_warnings"] == 0
 
 
-def test_parse_metrics_sums_all_four_when_total_missing():
-    """If total is absent, sum input + output + cacheRead + cacheWrite."""
+def test_parse_metrics_sums_all_four_components():
+    """Always sum input + output + cacheRead + cacheWrite (regardless of
+    whether total is present)."""
     transcript = (
         '{"meta": {"agentMeta": {"usage": '
         '{"input": 100, "output": 50, "cacheRead": 1000, "cacheWrite": 200}}}}'
@@ -249,9 +304,12 @@ def test_parse_metrics_tolerates_unknown_usage_fields_with_warning():
     )
 
 
-def test_parse_metrics_total_zero_with_nonzero_components_falls_through():
-    """Defensive: if upstream ever buggily emits total=0 alongside nonzero components,
-    truthy fall-through to the sum self-heals. (Pure-truthy check on usage.total.)
+def test_parse_metrics_total_zero_with_nonzero_components_uses_sum():
+    """A total=0 with nonzero components must yield the component sum.
+
+    Originally this test motivated a truthy fall-through (total=0 → sum). With
+    the cumulative-components fix the fall-through is unconditional — total is
+    always ignored — but the assertion remains the same: we report 350.
     """
     transcript = (
         '{"meta": {"agentMeta": {"usage": '
