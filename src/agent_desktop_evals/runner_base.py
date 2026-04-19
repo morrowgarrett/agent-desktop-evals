@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from agent_desktop_evals.scenario import Scenario
 
@@ -27,6 +27,11 @@ class RunResult(BaseModel):
     started_at_iso: str
     error: str | None = None
     parse_warnings: int = 0
+    # Per-tool-call counts keyed by tool name. Populated by runners that can
+    # introspect their agent's tool-invocation log (e.g. OpenClawRunner reading
+    # the per-session JSONL after the run). Non-introspecting runners leave
+    # this empty.
+    tool_calls: dict[str, int] = Field(default_factory=dict)
 
 
 class Runner(Protocol):

@@ -835,6 +835,140 @@ def test_openclaw_runner_transcript_includes_argv_and_meta_sections(
     assert "parse_warnings:" in content
 
 
+# --- tool-call extraction tests (session log integration) ---
+
+
+def _session_log_with_tool_calls(
+    session_root: Path,
+    agent_id: str,
+    session_id: str,
+    *,
+    tool_names: list[str],
+) -> Path:
+    """Stage a fake OpenClaw session JSONL containing the given tool calls.
+
+    Mirrors the real layout: <session_root>/<agent_id>/sessions/<sid>.jsonl.
+    """
+    sessions_dir = session_root / agent_id / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    log_file = sessions_dir / f"{session_id}.jsonl"
+    lines = [
+        json.dumps({"type": "session", "id": session_id,
+                    "timestamp": "2026-04-19T00:00:00Z"}),
+        json.dumps({
+            "type": "message",
+            "id": "a1",
+            "timestamp": "2026-04-19T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "toolCall", "id": f"tc{i}", "name": name,
+                     "arguments": "..."}
+                    for i, name in enumerate(tool_names)
+                ],
+            },
+        }),
+    ]
+    log_file.write_text("\n".join(lines) + "\n")
+    return log_file
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_runner_populates_tool_calls_from_session_log(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """Runner must read the session JSONL and populate RunResult.tool_calls.
+
+    Wires together: (1) parsing sessionId from meta.agentMeta.sessionId in the
+    OpenClaw JSON output, (2) resolving the per-session log path under the
+    configurable session root, (3) extracting per-tool counts.
+    """
+    sid = "fake-session-abc"
+    session_root = tmp_path / "sessions"
+    _session_log_with_tool_calls(
+        session_root, agent_id="main", session_id=sid,
+        tool_names=["exec", "exec"],
+    )
+    fake_stdout = json.dumps({"meta": {"agentMeta": {
+        "sessionId": sid,
+        "usage": {"input": 10, "output": 5, "total": 15},
+    }}})
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout=fake_stdout, stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(
+        agent_id="main",
+        openclaw_session_root=session_root,
+        transcript_dir=None,  # disable persistence for this test
+    )
+    result = runner.run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.tool_calls == {"exec": 2}, f"got {result.tool_calls}"
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_runner_tool_calls_empty_when_session_log_missing(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """If the session log doesn't exist on disk, tool_calls is empty (not a crash)."""
+    sid = "no-log-session"
+    fake_stdout = json.dumps({"meta": {"agentMeta": {
+        "sessionId": sid,
+        "usage": {"input": 1, "output": 1, "total": 2},
+    }}})
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout=fake_stdout, stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(
+        agent_id="main",
+        openclaw_session_root=tmp_path / "nonexistent",
+        transcript_dir=None,
+    )
+    result = runner.run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.tool_calls == {}, f"missing log must yield empty, got {result.tool_calls}"
+    # The rest of the result should still be populated normally.
+    assert result.tokens == 2
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_runner_tool_calls_empty_when_no_sessionid_in_output(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path, tmp_path: Path
+):
+    """If OpenClaw output omits sessionId (older versions / parse failure),
+    we can't know which file to read — return empty rather than guess."""
+    fake_stdout = json.dumps({"meta": {"agentMeta": {
+        "usage": {"input": 1, "output": 1, "total": 2},
+    }}})
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout=fake_stdout, stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    runner = OpenClawRunner(
+        agent_id="main",
+        openclaw_session_root=tmp_path / "sessions",
+        transcript_dir=None,
+    )
+    result = runner.run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.tool_calls == {}
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_runner_default_tool_calls_empty_when_no_introspection(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """Backward compat: existing test paths that don't stage a session log
+    must still produce a valid RunResult with tool_calls={} (not None / not crash)."""
+    mock_run.side_effect = [
+        MagicMock(returncode=0, stdout="", stderr=""),
+        MagicMock(returncode=0, stdout="", stderr=""),
+    ]
+    result = OpenClawRunner(transcript_dir=None).run(
+        Scenario.load(scenario_dir), mode=Mode.AUGMENTED
+    )
+    assert result.tool_calls == {}
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell-out")
 def test_real_subprocess_with_invalid_utf8_does_not_crash(scenario_dir: Path, tmp_path: Path):
     """Replaces the prior mock-only UnicodeDecodeError test, which couldn't

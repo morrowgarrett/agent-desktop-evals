@@ -39,9 +39,17 @@ def run(scenario_path: Path, runner: str, mode: str, report_dir: Path) -> None:
     (report_dir / "report.md").write_text(render_markdown([result]))
     (report_dir / "report.csv").write_text(render_csv([result]))
 
-    click.echo(f"{scenario.id} {runner} {mode}: "
-               f"success={result.success} tokens={result.tokens} "
-               f"screenshots={result.screenshots} wallclock={result.wallclock_s:.2f}s")
+    summary = (
+        f"{scenario.id} {runner} {mode}: "
+        f"success={result.success} tokens={result.tokens} "
+        f"screenshots={result.screenshots} wallclock={result.wallclock_s:.2f}s"
+    )
+    if result.tool_calls:
+        # Sort by count desc, then by name asc for stable tie-breaking.
+        ordered = sorted(result.tool_calls.items(), key=lambda kv: (-kv[1], kv[0]))
+        rendered = ",".join(f"{name}:{count}" for name, count in ordered)
+        summary += f" tool_calls={rendered}"
+    click.echo(summary)
     if result.parse_warnings > 0:
         click.echo(
             f"warning: {result.parse_warnings} transcript event(s) failed validation",

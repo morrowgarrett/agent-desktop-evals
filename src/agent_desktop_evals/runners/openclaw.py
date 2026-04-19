@@ -13,6 +13,7 @@ from pathlib import Path
 from pydantic import BaseModel, ConfigDict, NonNegativeInt, ValidationError
 
 from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
+from agent_desktop_evals.runners._openclaw_session import extract_tool_calls
 from agent_desktop_evals.scenario import Scenario
 
 # Sentinel distinguishing "use the default transcript_dir" from "explicitly
@@ -175,6 +176,32 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
     return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
 
+def _extract_session_id(transcript: str) -> str | None:
+    """Locate ``meta.agentMeta.sessionId`` in the OpenClaw JSON output.
+
+    Returns the LAST sessionId encountered (matching the cumulative-last-wins
+    pattern used for tokens; in practice OpenClaw emits one sessionId per run
+    but multiple agentMeta blocks may all carry it).
+
+    Returns None if no decodable JSON object contains a string sessionId
+    under meta.agentMeta. Kept separate from ``_parse_metrics`` so the
+    well-tested token-parser semantics stay untouched.
+    """
+    objects, _ = _find_json_objects(transcript)
+    last_sid: str | None = None
+    for data in objects:
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            continue
+        agent_meta = meta.get("agentMeta")
+        if not isinstance(agent_meta, dict):
+            continue
+        sid = agent_meta.get("sessionId")
+        if isinstance(sid, str) and sid:
+            last_sid = sid
+    return last_sid
+
+
 def _coerce_text(value: object) -> str:
     """Coerce subprocess output (str | bytes | None) to a str for transcript dump.
 
@@ -279,6 +306,7 @@ class OpenClawRunner:
         openclaw_bin: str = "openclaw",
         agent_id: str = "main",
         transcript_dir: Path | str | None | object = _DEFAULT_TRANSCRIPT_DIR,
+        openclaw_session_root: Path | str | None = None,
     ):
         # Resolve to an absolute path at init time. This way, BASELINE-mode
         # PATH-stripping (which removes dirs containing agent-desktop) doesn't
@@ -302,6 +330,12 @@ class OpenClawRunner:
             self._transcript_dir = None
         else:
             self._transcript_dir = Path(transcript_dir)  # type: ignore[arg-type]
+        # Where OpenClaw writes per-session JSONL logs. Defaults to the
+        # canonical ~/.openclaw/agents/ root; tests inject a tmp dir.
+        if openclaw_session_root is None:
+            self._session_root: Path = Path.home() / ".openclaw" / "agents"
+        else:
+            self._session_root = Path(openclaw_session_root)
 
     def run(self, scenario: Scenario, mode: Mode) -> RunResult:
         started = now_iso()
@@ -380,6 +414,11 @@ class OpenClawRunner:
 
         wallclock_s = time.monotonic() - t0
         metrics = _parse_metrics(transcript)
+        # Tool-call introspection: only attempt when OpenClaw exposed a
+        # sessionId we can use to anchor reads in the per-session JSONL.
+        # Failed-agent runs may still expose sessionId — try anyway so failure
+        # transcripts carry tool-call evidence when available.
+        tool_calls = self._read_tool_calls(transcript)
 
         # Even if check_state would pass, a failed agent invocation must not be
         # reported as success: a leftover desktop state from a prior run could
@@ -395,6 +434,7 @@ class OpenClawRunner:
                 error=f"agent exited {proc.returncode}: {stderr_msg}",
                 tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
+                tool_calls=tool_calls,
             )
 
         # Verify success via the scenario's check script.
@@ -416,6 +456,7 @@ class OpenClawRunner:
                 error=f"check_state timed out after {scenario.check_timeout_seconds}s",
                 tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 parse_warnings=metrics["parse_warnings"],
+                tool_calls=tool_calls,
             )
         success = check.returncode == scenario.expect_exit_code
 
@@ -426,7 +467,25 @@ class OpenClawRunner:
             returncode=proc.returncode, success=success, error=error,
             tokens=metrics["tokens"], screenshots=metrics["screenshots"],
             parse_warnings=metrics["parse_warnings"],
+            tool_calls=tool_calls,
         )
+
+    def _read_tool_calls(self, transcript: str) -> dict[str, int]:
+        """Extract per-tool invocation counts from the OpenClaw session log.
+
+        Returns an empty dict (without crashing) whenever:
+        - OpenClaw output didn't expose a sessionId,
+        - the session log file doesn't exist,
+        - the session anchor can't be located in the file,
+        - reading the file fails.
+        """
+        session_id = _extract_session_id(transcript)
+        if not session_id:
+            return {}
+        session_log = (
+            self._session_root / self._agent_id / "sessions" / f"{session_id}.jsonl"
+        )
+        return extract_tool_calls(session_log, session_id)
 
     def _finalize(
         self,
@@ -444,6 +503,7 @@ class OpenClawRunner:
         tokens: int,
         screenshots: int,
         parse_warnings: int,
+        tool_calls: dict[str, int] | None = None,
     ) -> RunResult:
         """Build a RunResult, persisting the transcript first when enabled.
 
@@ -486,6 +546,7 @@ class OpenClawRunner:
             error=error,
             parse_warnings=parse_warnings,
             transcript_path=transcript_path,
+            tool_calls=tool_calls or {},
         )
 
     @staticmethod
