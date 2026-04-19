@@ -70,7 +70,9 @@ def test_tokens_from_usage_uses_cumulative_components_not_total():
         input=35501, output=1883, cacheRead=236416, cacheWrite=0, total=22994
     )
     # Cumulative billable is the sum, NOT the per-call total.
-    assert _tokens_from_usage(usage) == 35501 + 1883 + 236416 + 0
+    # (An earlier assertion here restated the implementation formula verbatim —
+    # dropped because it was tautological: it would pass whenever the sum
+    # equals the sum, teaching us nothing about the function's behavior.)
     assert _tokens_from_usage(usage) == 273800
     assert _tokens_from_usage(usage) != 22994  # the buggy value
 
@@ -87,6 +89,27 @@ def test_tokens_from_usage_ignores_total_when_diverges():
     components."""
     usage = _Usage(input=100, output=50, cacheRead=200, cacheWrite=0, total=999999)
     assert _tokens_from_usage(usage) == 350  # NOT 999999
+
+
+def test_parse_metrics_handles_missing_total_field():
+    """When usage omits total, sum the components."""
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "cacheRead": 200, "cacheWrite": 0}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 350
+
+
+def test_parse_metrics_handles_null_total_field():
+    """When usage explicitly sends total: null, sum the components."""
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "cacheRead": 200, '
+        '"cacheWrite": 0, "total": null}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 350
 
 
 def test_parse_metrics_real_fixture_full_token_count():

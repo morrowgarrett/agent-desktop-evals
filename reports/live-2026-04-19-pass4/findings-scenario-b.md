@@ -1,5 +1,15 @@
 # Scenario B — first paired live run (2026-04-19 pass 4)
 
+> **QUARANTINED — do NOT trust the numbers in this doc (2026-04-19 F2 fallout).**
+>
+> Pass-4 ran BEFORE both of the fixes that made the bench trustworthy:
+> - **G2 (session contamination, fixed commit `745eab1`):** the persistent OpenClaw `main`-agent session was reused across every run. `usage.{input,output,cacheRead,cacheWrite}` accumulated across runs, so counts are cumulative-across-all-prior-work, NOT per-run.
+> - **F2 (token-formula bug, fixed commit `977faaa`):** `_tokens_from_usage` preferred `usage.total` (per-call, overwritten each turn), systematically undercounting cumulative billable.
+>
+> The two bugs compound here: the originally reported **baseline 186,306 / augmented 177,853** are simultaneously (a) per-call-last-turn not cumulative (F2) AND (b) polluted by prior session state (G2). They are not comparable **across runs** AND not comparable **within a run**. There is no simple post-hoc correction — pass-4 transcripts were gitignored before M1.5 #1 landed, so they cannot be re-derived either.
+>
+> Pass-4 is preserved below as historical narrative. The qualitative observations (what each agent actually did — tool call sequences) remain informative; the quantitative metrics (tokens, wall-clock ratios) are not defensible. For the first methodologically clean paired run (G2 + F2 both fixed, transcripts persisted and re-derivable), see `reports/live-2026-04-19-pass5/findings-pass5.md`.
+
 > **Status: defensible.** Real data with documented methodology limitations. Multiple runs needed for statistical claims, but the qualitative finding is reproducible-in-principle and surprising enough to warrant the writeup.
 
 ## Headline finding

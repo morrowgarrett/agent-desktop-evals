@@ -1,5 +1,18 @@
 # Scenario A — first paired live run (2026-04-19)
 
+> **QUARANTINED — token numbers in this doc are NOT trustworthy (2026-04-19 F2 fallout).**
+>
+> This file covers scenario A pass-1/2/3 runs that happened BEFORE two separate fixes:
+> - **G2 (session contamination, fixed commit `745eab1`):** all runs reused the same OpenClaw persistent session, so `usage.{input,output,cacheRead,cacheWrite}` accumulated across runs. Numbers are not per-run counts.
+> - **F2 (token-formula bug, fixed commit `977faaa`):** `_tokens_from_usage` preferred `usage.total` (per-call, not cumulative). The originally reported pass-1/2/3 tokens (152,231 / 160,998 / 161,388 / 157,534) were undercounted by ~5-7x for those single-session runs.
+>
+> **Re-derivation status:**
+> - Pass-1 baseline (152,231) and pass-1 augmented (160,998): transcripts **NOT persisted** (before M1.5 #1 landed). Cannot be re-derived. Estimate only.
+> - Pass-2 baseline (161,388): transcript exists (`reports/raw/a-gnome-settings/baseline/20260419-131007-71c40e82.txt`). Corrected cumulative components sum to **806,213 tokens** — but this reflects **accumulated session state from earlier runs**, not this run alone. Not comparable across runs or useful as an isolated count.
+> - Pass-3 augmented (157,534): transcript exists (`reports/raw/a-gnome-settings-augmented/augmented/20260419-133258-482076aa.txt`). Corrected sum **1,084,853 tokens** — same G2 contamination caveat.
+>
+> The raw observations below preserve the **originally reported** (now known-wrong) numbers as a historical record; do not quote them as if correct. Pass-5 (scenario B, commit `745eab1`+`977faaa`) is the first methodologically clean pairing — see `reports/live-2026-04-19-pass5/findings-pass5.md`.
+
 > **Status: this is a single n=1 paired run with documented methodology gaps. NOT writeup-ready.** A second adversarial review surfaced multiple unsupported claims in an earlier draft of this file. This version is the corrected, claims-restricted record. The empirical work to support a public writeup is tracked as M1.5 (see "What's missing for writeup-readiness" below).
 
 ## Raw observations (the only things we can defend)

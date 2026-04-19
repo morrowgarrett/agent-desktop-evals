@@ -2,7 +2,9 @@
 
 > **Status: this is the first methodologically-clean paired run.** Pass-4 numbers are now known to be heavily distorted by session contamination (G2 from prior findings); pass-5 uses the G2 fix (`--session-id $(uuidgen)` per run, commit `745eab1`).
 
-> **Token-count correction (2026-04-19):** the originally reported pass-5 token counts (22,994 / 21,967) were wrong by ~12×. Root cause: OpenClaw's `meta.agentMeta.usage.total` is overwritten per call (matches `lastCallUsage.total`) rather than accumulated across turns; the bench's `_tokens_from_usage` was preferring `total` over the cumulative `input/output/cacheRead/cacheWrite` sum. Fixed in `fix(runner): always sum cumulative usage components (do not trust usage.total)`. Numbers below have been re-derived from the persisted transcripts in `reports/raw/b-libreoffice-write/{baseline,augmented}/`.
+> **Token-count correction (2026-04-19):** the originally reported pass-5 token counts (22,994 / 21,967) were wrong by ~12×. Root cause: OpenClaw's `meta.agentMeta.usage.total` is overwritten per call (matches `lastCallUsage.total`) rather than accumulated across turns; the bench's `_tokens_from_usage` was preferring `total` over the cumulative `input/output/cacheRead/cacheWrite` sum. Fixed in `fix(runner): always sum cumulative usage components (do not trust usage.total)` (commit `977faaa`). Numbers below have been re-derived from the persisted transcripts in `reports/raw/b-libreoffice-write/{baseline,augmented}/`.
+>
+> The per-run report files at `reports/live-2026-04-19-pass5/{b-baseline,b-augmented}/report.{md,csv}` have been regenerated in-place with the corrected token counts. The CSV renderer does not support comments, so those files now have a **leading `#` comment line** flagging the regeneration; strip that line before ingesting as CSV.
 
 ## Headline result
 
@@ -19,7 +21,7 @@ The clean-session data tells a different story than pass-4:
 | `read` calls (orientation) | 7 | 1 | −86% |
 | `agent-desktop` shell-outs | 4 | 4 | 0 |
 | `process` calls | 0 | 2 | new |
-| `parse_warnings` | 3 | 0 | C-C detector firing on baseline |
+| `parse_warnings` | 3 | 0 | log-line JSON noise on baseline stderr (not C-C drift — see section below) |
 
 The corrected token numbers narrow the augmented-vs-baseline gap (−2.6% vs the formerly reported −4.5%); the difference is well inside single-run variance for OpenClaw API calls. Augmented is 24% lower tool calls overall, mostly because it loaded less orientation context. **It is NOT meaningfully cheaper in tokens, NOT faster, AND ran into the same Wayland blocker as baseline.**
 
@@ -87,9 +89,23 @@ To get a TRUE binary-absence baseline, we'd need to:
 
 One paired run. Corrected tokens were within 2.6% of each other; wallclock within 6.1%. Both within plausible single-run variance for OpenClaw API calls. **Need N≥5 paired before any quantitative claim.**
 
-### New: the C-C drift detector fired 3x in baseline, 0x in augmented
+### parse_warnings=3 in baseline — attribution corrected
 
-Same OpenClaw, same model, same parser. The 3 baseline parse_warnings indicate the C-C drift detector found something unknown in the JSON. We have the transcript persisted (per M1.5 #1) so this is now investigable. Worth a follow-up to identify the unknown field — could be a real schema drift signal or a benign edge case. Not blocking.
+**Earlier drafts mis-attributed this to the C-C drift detector (Pydantic `model_extra` check on new `usage` fields). That is wrong.** The drift detector was never reached in this run — no new/unknown fields appeared in any `meta.agentMeta.usage` block.
+
+Investigation of the persisted transcript (`reports/raw/b-libreoffice-write/baseline/20260419-142538-7ae748a6.txt`) shows the 3 warnings come from log-line JSON noise, not schema drift. OpenClaw's stderr contains lines like:
+
+```
+[tools] read failed: ENOENT: no such file or directory, access '/home/garrett/MEMORY.md' raw_params={"path":"/home/garrett/MEMORY.md"}
+```
+
+The `_find_json_objects` scanner decodes the `{"path":"/home/garrett/MEMORY.md"}` fragment as a valid JSON dict. It then fails the `isinstance(meta, dict)` check in `_parse_metrics` (no `meta` key at all) and increments `parse_warnings`. Three such lines → three warnings. Augmented didn't hit these because the agent there didn't trigger the same `read` failures.
+
+**Implication:** `parse_warnings` currently conflates two very different signals:
+1. Real schema drift (Pydantic `extra='allow'` + `model_extra` non-empty) — actionable, means "add a field to `_Usage`."
+2. Log-line JSON noise (small dicts with no `meta` key) — noise, means "another stderr log had a JSON-shaped value."
+
+The current metric can't distinguish them. Operators should treat non-zero `parse_warnings` as "go look at the transcript," not "schema drift detected."
 
 ## Defensible writeup angle (after this run)
 
@@ -107,7 +123,7 @@ This is honest, specific, and points at the upstream bug as the bottleneck. Step
 
 ## Next-actions queue
 
-1. **Investigate parse_warnings=3 in baseline** — what fields triggered the C-C drift detector?
+1. **Consider distinguishing "noise skip" from "drift detection" in parse_warnings** — the metric currently conflates log-line JSON noise (e.g., `{"path":"..."}` fragments in stderr that decode as valid dicts but lack `meta`) with actual Pydantic schema drift on `meta.agentMeta.usage`. Only the latter is actionable as "new OpenClaw field; extend `_Usage`"; the former is "operator goes and reads the transcript." Separate counters (e.g., `parse_warnings_schema` vs `parse_warnings_noise`) would make the signal actionable.
 2. **Decide on G1 fix** — strong baseline (rename binary) or accept the "skill registered vs not" framing?
 3. **Run N≥5 paired** of B with clean methodology before quantitative claims.
 4. **Author scenario C** that's TRULY CLI-unrouteable — for example, Telegram chat read (no CLI for chat scrollback). May still hit issue #24 on Wayland though.

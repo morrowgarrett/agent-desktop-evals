@@ -64,6 +64,22 @@ def _tokens_from_usage(usage: _Usage) -> int:
     equal sum, and produced ~12x undercounts on multi-turn runs. The _Usage
     .total field is preserved (still emitted by OpenClaw, useful for per-call
     cost analysis if needed later) but is no longer consulted here.
+
+    Future schema drift policy:
+    When OpenClaw adds a new cumulative field to usage (e.g., reasoning_tokens
+    for o-series / gpt-5 reasoning models), the C-C drift detector will fire
+    (parse_warnings += 1 via the model_extra check in _parse_metrics) but the
+    new field will NOT be summed by this function. Operators must notice the
+    warning AND decide whether to extend the formula. We chose this over
+    auto-summing all numeric fields in usage because:
+      - Auto-sum could double-count if upstream emits derived fields (like
+        `total`, which we explicitly exclude; similar derived aggregates could
+        appear in the future).
+      - Explicit allowlist gives us a chance to consider semantics (e.g., is
+        reasoning_tokens already folded into input/output, or genuinely
+        additive?).
+    When this fires in production, file an issue against the bench to extend
+    _Usage and _tokens_from_usage with the new field.
     """
     return usage.input + usage.output + usage.cacheRead + usage.cacheWrite
 
