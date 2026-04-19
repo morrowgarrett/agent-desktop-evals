@@ -16,9 +16,26 @@
 
 The two runs used different scenario IDs (`a-gnome-settings` and `a-gnome-settings-augmented`), so the bench's paired-comparison code path didn't fire. The table above was hand-typed from the two single-mode reports. The bench's `render_markdown` paired-delta logic remains **untested in production**.
 
-## What this run does NOT tell us
+## Update 2026-04-19 08:30 — concrete tool-call evidence from re-run
 
-- **Which tools either agent used.** The bench parser doesn't capture per-tool-call counts. `screenshots = 0` is a placeholder default (the parser has a TODO at `runners/openclaw.py` line ~122 noting screenshot detection is stubbed). Both runs' raw stdout/stderr were not persisted to disk — only the bench's one-line summary survived. We do not know whether the agent (a) opened gnome-control-center, (b) called `gsettings set` via `exec`, (c) invoked `agent-desktop interact`, or (d) some combination. **Any prior phrasing in this file or HANDOFF claiming "agents bypassed the GUI" was inferred from a placeholder and should be discarded.**
+After the M1.5 #1 commit added transcript persistence, baseline was re-run (`reports/live-2026-04-19-pass2/baseline/`). Cross-referencing OpenClaw's session log at `~/.openclaw/agents/main/sessions/<sessionId>.jsonl` (which records all tool calls) revealed the baseline agent's actual behavior:
+
+| # | tool | command | result |
+|---|------|---------|--------|
+| 1 | `exec` | `gnome-control-center background` (background mode) | "Command still running (pid 37062)" — GUI launched |
+| 2 | `exec` | `gsettings set` × 5 keys (picture-uri, picture-uri-dark, color-shading-type, primary-color, secondary-color → `#1f6f4a` solid green) | (no output) |
+| 3 | `exec` | `gsettings get` × 3 (verification) | `'#1f6f4a' '#1f6f4a' 'solid'` |
+| 4 | `exec` | `ps -ef | grep '[g]nome-control-center' | xargs kill` | (no output) |
+
+**Total: 4 `exec` calls, 0 other tools used.** The agent literally opened the GUI (the prompt said "Open GNOME Settings, navigate to Background"), then bypassed all GUI interaction by writing dconf keys directly, then killed the GUI process (interpreting "exit" literally).
+
+This is concrete data — supersedes prior speculation. Re-run pass-2 totals: tokens=161,388 (vs pass-1 152,231 — variance), wallclock=60.54s (vs 71.39s — variance), parse_warnings=0 (vs pass-1 1 — confirming the warning was non-deterministic / transient OpenClaw event).
+
+**Hold on the augmented run** until M1.5 #2 lands so we can capture the same per-tool data in augmented mode for direct comparison.
+
+## What this run does NOT tell us (now narrower)
+
+- **Whether the augmented agent would behave differently.** The augmented run from pass-1 wasn't captured with transcript persistence. Need to re-run augmented after #2 (parser surfaces tool calls from session log) to compare.
 - **Whether the augmented prompt actually exercised agent-desktop.** Same gap as above. The SKILL.md was prepended to the prompt, but we can't observe whether the agent invoked any agent-desktop subcommand.
 - **Whether the token delta is meaningful.** `meta.agentMeta.usage.total = input + output + cacheRead + cacheWrite`. The smoke-fixture data the parser was modeled on had `cacheRead` at ~97% of `total`. With one run each, no per-component breakdown captured, and OpenClaw cache state varying across runs, the +5.8% delta could be SKILL.md input cost, response-length variance, cache-state difference, or any combination. We can't attribute it.
 - **Whether augmented is meaningfully faster than baseline.** With n=1 each and OpenClaw API-call wall-clock varying ±10-20s plausibly, the 11s delta is well within the noise envelope. The earlier draft's "15% faster" headline was statistical garbage. Actual signal requires N≥5 paired runs.
