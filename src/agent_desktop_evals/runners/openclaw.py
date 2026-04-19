@@ -7,7 +7,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from pydantic import BaseModel, NonNegativeInt, ValidationError
+from pydantic import BaseModel, ConfigDict, NonNegativeInt, ValidationError
 
 from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
 from agent_desktop_evals.scenario import Scenario
@@ -18,11 +18,56 @@ class _Usage(BaseModel):
 
     Tokens must be non-negative ints; strings, floats, negatives reject so that
     upstream-format drift surfaces as a parse_warning rather than silently
-    miscounting.
+    miscounting. extra='forbid' so that future schema additions surface as
+    parse errors instead of silent token drops.
     """
 
-    input: NonNegativeInt
-    output: NonNegativeInt
+    model_config = ConfigDict(extra="forbid")
+
+    # Field names mirror the upstream OpenClaw JSON keys verbatim so that
+    # extra='forbid' validation works without aliasing. N815 (mixedCase) is
+    # therefore intentional.
+    input: NonNegativeInt = 0
+    output: NonNegativeInt = 0
+    cacheRead: NonNegativeInt = 0  # noqa: N815
+    cacheWrite: NonNegativeInt = 0  # noqa: N815
+    total: NonNegativeInt | None = None
+
+
+def _tokens_from_usage(usage: _Usage) -> int:
+    """Use the precomputed total when present; otherwise sum all four fields.
+
+    OpenClaw's createUsageAccumulator precomputes total = input+output+cacheRead+cacheWrite;
+    we prefer that over re-summing to avoid drift if the upstream definition changes.
+    """
+    if usage.total is not None:
+        return usage.total
+    return usage.input + usage.output + usage.cacheRead + usage.cacheWrite
+
+
+def _find_json_objects(text: str) -> list[dict]:
+    """Find all top-level JSON objects in a text stream, ignoring non-JSON content.
+
+    Uses json.JSONDecoder.raw_decode to scan past banners, log lines, and other
+    noise; advances past each successfully decoded object and continues scanning.
+    Skips '{' that don't begin valid JSON (e.g., banners containing braces).
+    """
+    decoder = json.JSONDecoder()
+    objects: list[dict] = []
+    i = 0
+    while i < len(text):
+        brace = text.find("{", i)
+        if brace == -1:
+            break
+        try:
+            obj, end_offset = decoder.raw_decode(text[brace:])
+        except json.JSONDecodeError:
+            i = brace + 1  # this '{' didn't start valid JSON; advance and retry
+            continue
+        if isinstance(obj, dict):
+            objects.append(obj)
+        i = brace + end_offset
+    return objects
 
 
 def _parse_metrics(transcript: str) -> dict[str, int]:
@@ -36,13 +81,15 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
           "payloads": [...],
           "meta": {
             "agentMeta": {
-              "usage": { "input": 114, "output": 5, ... }
+              "usage": { "input": 114, "output": 5, "cacheRead": 148608,
+                         "cacheWrite": 0, "total": 148727 }
             }
           }
         }
 
-    Strategy: locate the first `{` (skipping the banner), then json.loads from
-    there. The output is a single object, not JSONL.
+    Strategy: scan for all top-level JSON objects (raw_decode) and sum usage
+    from each that has a meta.agentMeta.usage block. This is robust against
+    trailing logs, banners with braces, multiple JSON objects, and noise.
 
     TODO(screenshots): real tool-usage shape is unknown — the smoke fixture
     only contains tool *definitions* under meta.agentMeta.systemPromptReport.
@@ -52,34 +99,31 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
     screenshots = 0  # TODO: refine when we have tool-usage output to inspect
     parse_warnings = 0
 
-    brace_idx = transcript.find("{")
-    if brace_idx == -1:
-        # No JSON content at all — empty input or banner-only. Not a warning.
+    objects = _find_json_objects(transcript)
+    if not objects:
+        # No valid JSON found at all — empty input, banner-only, or unparseable noise.
+        # Per design, noise on its own is not a warning.
         return {"tokens": 0, "screenshots": 0, "parse_warnings": 0}
 
-    try:
-        data = json.loads(transcript[brace_idx:])
-    except json.JSONDecodeError:
-        return {"tokens": 0, "screenshots": 0, "parse_warnings": 1}
-
-    if not isinstance(data, dict):
-        return {"tokens": 0, "screenshots": 0, "parse_warnings": 1}
-
-    usage_raw = (
-        data.get("meta", {}).get("agentMeta", {}).get("usage")
-        if isinstance(data.get("meta"), dict)
-        and isinstance(data["meta"].get("agentMeta"), dict)
-        else None
-    )
-    if not isinstance(usage_raw, dict):
-        parse_warnings += 1
-    else:
+    for data in objects:
+        meta = data.get("meta")
+        if not isinstance(meta, dict):
+            parse_warnings += 1
+            continue
+        agent_meta = meta.get("agentMeta")
+        if not isinstance(agent_meta, dict):
+            parse_warnings += 1
+            continue
+        usage_raw = agent_meta.get("usage")
+        if not isinstance(usage_raw, dict):
+            parse_warnings += 1
+            continue
         try:
             usage = _Usage.model_validate(usage_raw, strict=True)
         except ValidationError:
             parse_warnings += 1
-        else:
-            tokens = usage.input + usage.output
+            continue
+        tokens += _tokens_from_usage(usage)
 
     return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
@@ -131,6 +175,7 @@ class OpenClawRunner:
                 env=env,
                 capture_output=True,
                 text=True,
+                errors="replace",  # tolerate non-UTF8 bytes in subprocess output
                 timeout=scenario.timeout_seconds,
                 check=False,
             )
@@ -146,7 +191,10 @@ class OpenClawRunner:
                 wallclock_s=time.monotonic() - t0, started_at_iso=started,
                 error=f"timeout after {scenario.timeout_seconds}s",
             )
-        except (FileNotFoundError, PermissionError, OSError) as e:
+        except (FileNotFoundError, PermissionError, OSError, UnicodeDecodeError) as e:
+            # UnicodeDecodeError is defensive belt-and-suspenders: errors='replace'
+            # above should prevent it, but if a future code path uses errors='strict'
+            # we don't want to crash the runner mid-eval.
             return RunResult(
                 scenario_id=scenario.id, runner_name=self.name, mode=mode,
                 success=False, tokens=0, screenshots=0,
@@ -179,6 +227,7 @@ class OpenClawRunner:
             check = subprocess.run(
                 ["bash", str(scenario.check_script)],
                 capture_output=True, text=True,
+                errors="replace",  # tolerate non-UTF8 bytes in check_state output
                 timeout=scenario.check_timeout_seconds,
             )
         except subprocess.TimeoutExpired:

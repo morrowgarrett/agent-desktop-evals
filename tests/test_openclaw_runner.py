@@ -20,13 +20,91 @@ def test_parse_metrics_from_real_openclaw_output():
 
     Ground truth: tests/fixtures/openclaw-smoke-output.txt is a real run of
     `openclaw agent --agent main --local --message "Reply with just the word OK" --json`
-    captured from stderr. Token counts are at meta.agentMeta.usage.{input,output}
-    in that fixture. Sum is 114 + 5 = 119.
+    captured from stderr. Token counts are at meta.agentMeta.usage.total
+    (the precomputed cumulative accumulator) in that fixture. Real value: 148727.
+    Previously the parser only summed input + output (= 119) and silently dropped
+    cacheRead and cacheWrite, undercounting by three orders of magnitude.
     """
     content = SMOKE_FIXTURE.read_text()
     result = _parse_metrics(content)
-    assert result["tokens"] == 119, f"got {result}"
+    assert result["tokens"] == 148727, f"got {result}"
     assert result["screenshots"] == 0
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_prefers_total_field():
+    """When 'total' is present in usage, use it as authoritative.
+
+    OpenClaw's createUsageAccumulator precomputes total = input+output+cacheRead+cacheWrite;
+    we prefer that over re-summing to avoid drift if the upstream definition changes.
+    """
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 114, "output": 5, "cacheRead": 148608, "total": 148727}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 148727, f"expected 148727, got {result}"
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_sums_all_four_when_total_missing():
+    """If total is absent, sum input + output + cacheRead + cacheWrite."""
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "cacheRead": 1000, "cacheWrite": 200}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 1350, f"expected 1350, got {result}"
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_handles_trailing_log_after_json():
+    """Log line after the JSON object should not zero the parse."""
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": '
+        '{"input": 100, "output": 50, "total": 150}}}}\n'
+        "[shutdown] cleanup complete"
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 150, f"trailing log should not break parse, got {result}"
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_skips_banner_with_brace():
+    """Banner containing '{' should not derail the parser.
+
+    Previous strategy of `text.find('{')` would land inside the banner and fail.
+    """
+    transcript = (
+        "[plugins] loaded { 1 item } warning ok\n"
+        '{"meta": {"agentMeta": {"usage": {"input": 10, "output": 5, "total": 15}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 15
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_handles_multiple_json_objects():
+    """Multiple JSON objects (e.g., streamed events): sum usage from each that has a usage block."""
+    transcript = (
+        '{"meta": {"agentMeta": {"usage": {"input": 100, "output": 50, "total": 150}}}}'
+        "\n"
+        '{"meta": {"agentMeta": {"usage": {"input": 200, "output": 100, "total": 300}}}}'
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 450, f"expected sum 150+300, got {result}"
+    assert result["parse_warnings"] == 0
+
+
+def test_parse_metrics_handles_wrapped_in_noise():
+    """JSON wrapped by non-JSON noise on both sides should still parse."""
+    transcript = (
+        "Logging started\n"
+        '{"meta": {"agentMeta": {"usage": {"input": 10, "output": 5, "total": 15}}}}\n'
+        "Logging ended"
+    )
+    result = _parse_metrics(transcript)
+    assert result["tokens"] == 15
     assert result["parse_warnings"] == 0
 
 
@@ -50,17 +128,26 @@ def test_parse_metrics_skips_banner_before_json():
     assert metrics["parse_warnings"] == 0
 
 
-def test_parse_metrics_warns_on_unparseable_json():
-    """If everything after the first `{` fails to parse, return zeros and warn."""
+def test_parse_metrics_unparseable_json_with_no_other_objects_silently_zeros():
+    """If a `{` appears but does not begin valid JSON and no other JSON object follows,
+    parser silently zeros — noise on its own is not a warning, only mis-shaped data is.
+
+    Trade-off vs the prior behavior: robustness to log noise is more important than
+    flagging every stray `{` in banner output.
+    """
     transcript = "banner line\n{not valid json at all"
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["screenshots"] == 0
-    assert metrics["parse_warnings"] == 1
+    assert metrics["parse_warnings"] == 0
 
 
 def test_parse_metrics_warns_when_usage_missing():
-    """A JSON object without meta.agentMeta.usage gets zeros + a parse warning, not a crash."""
+    """A valid JSON object without meta.agentMeta.usage gets zeros + a parse warning.
+
+    We did successfully parse a JSON object — its shape is just wrong. That's
+    schema drift and must surface as a warning.
+    """
     transcript = '{"some_other": "shape"}'
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
@@ -382,14 +469,20 @@ def test_openclaw_runner_parses_stderr_not_stdout(
     causing tokens to silently be 0 on every real run.
     """
     fixture = SMOKE_FIXTURE.read_text()
-    agent_call = MagicMock(returncode=0, stdout="", stderr=fixture)
+    # Sentinel the alternate stream so we can detect a regression to stdout-only:
+    # if a future change reads only stdout, it would see this banner-only blob and
+    # parse zero — that's the bug shape we want to catch.
+    sentinel_stdout = "[plugins] noise on stdout that contains no usage block\n"
+    agent_call = MagicMock(returncode=0, stdout=sentinel_stdout, stderr=fixture)
     check_call = MagicMock(returncode=0)
     mock_run.side_effect = [agent_call, check_call]
     result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
-    assert result.tokens > 0, (
-        f"expected tokens > 0 from real fixture, got {result.tokens}"
+    # 148727 = real fixture's precomputed total (input 114 + output 5 + cacheRead 148608).
+    # Asserting the exact number ensures we're parsing stderr (where the JSON lives),
+    # not stdout (which here is sentinel banner-only and would parse to 0 tokens).
+    assert result.tokens == 148727, (
+        f"expected 148727 tokens from stderr fixture, got {result.tokens}"
     )
-    assert result.tokens == 119  # 114 input + 5 output from the fixture
     assert result.success is True
 
 
@@ -440,3 +533,41 @@ def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path, fake_opencl
     assert result.success is False
     assert result.error is not None
     assert "check_state timed out" in result.error.lower()
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_uses_errors_replace_for_subprocess_decoding(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """Both subprocess.run calls must pass errors='replace'.
+
+    Default text=True uses errors='strict', which raises UnicodeDecodeError on
+    any non-UTF8 byte in subprocess output. That used to crash the runner
+    mid-eval because the existing exception handler didn't catch ValueError
+    subclasses outside FileNotFoundError/PermissionError/OSError.
+    """
+    mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
+    OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+
+    for call in mock_run.call_args_list:
+        assert call.kwargs.get("errors") == "replace", (
+            f"subprocess.run called without errors='replace': {call.kwargs!r}"
+        )
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_handles_unicode_decode_error_gracefully(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """Belt-and-suspenders: if subprocess.run raises UnicodeDecodeError despite
+    errors='replace' (e.g., a future code path forgets the kwarg), the runner
+    must surface a failure RunResult instead of crashing the eval."""
+    mock_run.side_effect = UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    scenario = Scenario.load(scenario_dir)
+    result = OpenClawRunner().run(scenario, mode=Mode.AUGMENTED)
+
+    assert result.success is False
+    assert result.tokens == 0
+    assert result.error is not None
+    assert "failed to spawn" in result.error.lower()
