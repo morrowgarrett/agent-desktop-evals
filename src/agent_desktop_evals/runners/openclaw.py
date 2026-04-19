@@ -6,7 +6,6 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
-from typing import Any
 
 from pydantic import BaseModel, NonNegativeInt, ValidationError
 
@@ -14,94 +13,73 @@ from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
 from agent_desktop_evals.scenario import Scenario
 
 
-class _TurnComplete(BaseModel):
-    """Strict shape for a turn_complete event.
+class _Usage(BaseModel):
+    """Strict shape for the meta.agentMeta.usage block emitted by OpenClaw 2026.4.9.
 
-    Tokens must be non-negative ints; null degrades to zero (handled by
-    field-level coercion before validation). Strings, floats, negatives reject.
+    Tokens must be non-negative ints; strings, floats, negatives reject so that
+    upstream-format drift surfaces as a parse_warning rather than silently
+    miscounting.
     """
 
-    input_tokens: NonNegativeInt = 0
-    output_tokens: NonNegativeInt = 0
-
-
-def _coerce_null(value: Any) -> Any:
-    """Treat JSON null as 0 for token fields (pre-validation tolerance)."""
-    return 0 if value is None else value
-
-
-def _split_objects(blob: str) -> list[str]:
-    """Split a string that may contain one or more JSON objects (compact or pretty-printed)
-    into individual top-level JSON object strings using a brace-balance scan.
-
-    Skips characters outside top-level objects (so log preamble/trailing text is ignored).
-    Strings and escapes are tracked so braces inside them don't confuse the scanner.
-    """
-    out: list[str] = []
-    depth = 0
-    start = -1
-    in_str = False
-    esc = False
-    for i, ch in enumerate(blob):
-        if in_str:
-            if esc:
-                esc = False
-            elif ch == "\\":
-                esc = True
-            elif ch == '"':
-                in_str = False
-            continue
-        if ch == '"':
-            in_str = True
-            continue
-        if ch == "{":
-            if depth == 0:
-                start = i
-            depth += 1
-        elif ch == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start >= 0:
-                    out.append(blob[start : i + 1])
-                    start = -1
-    return out
+    input: NonNegativeInt
+    output: NonNegativeInt
 
 
 def _parse_metrics(transcript: str) -> dict[str, int]:
-    """Sum token counts and count screenshot tool calls from a transcript.
+    """Extract token counts and (eventually) screenshot counts from real OpenClaw output.
 
-    Accepts both compact JSONL and pretty-printed multi-line JSON. Validates
-    event shapes via Pydantic; rejected events increment parse_warnings rather
-    than silently miscounting.
+    Real shape, captured 2026-04-18 from `openclaw agent --agent main --local
+    --message ... --json` (see tests/fixtures/openclaw-smoke-output.txt):
+
+        [plugins] plugins.allow is empty; ...   <-- non-JSON banner on first line
+        {
+          "payloads": [...],
+          "meta": {
+            "agentMeta": {
+              "usage": { "input": 114, "output": 5, ... }
+            }
+          }
+        }
+
+    Strategy: locate the first `{` (skipping the banner), then json.loads from
+    there. The output is a single object, not JSONL.
+
+    TODO(screenshots): real tool-usage shape is unknown — the smoke fixture
+    only contains tool *definitions* under meta.agentMeta.systemPromptReport.
+    Once a tool-using run is captured, refine screenshot detection here.
     """
     tokens = 0
-    screenshots = 0
+    screenshots = 0  # TODO: refine when we have tool-usage output to inspect
     parse_warnings = 0
 
-    for raw in _split_objects(transcript):
-        try:
-            event = json.loads(raw)
-        except json.JSONDecodeError:
-            parse_warnings += 1
-            continue
-        if not isinstance(event, dict):
-            parse_warnings += 1
-            continue
+    brace_idx = transcript.find("{")
+    if brace_idx == -1:
+        # No JSON content at all — empty input or banner-only. Not a warning.
+        return {"tokens": 0, "screenshots": 0, "parse_warnings": 0}
 
-        kind = event.get("event")
-        if kind == "turn_complete":
-            payload = {
-                "input_tokens": _coerce_null(event.get("input_tokens", 0)),
-                "output_tokens": _coerce_null(event.get("output_tokens", 0)),
-            }
-            try:
-                tc = _TurnComplete.model_validate(payload, strict=True)
-            except ValidationError:
-                parse_warnings += 1
-                continue
-            tokens += tc.input_tokens + tc.output_tokens
-        elif kind == "tool_call" and event.get("tool") == "screenshot":
-            screenshots += 1
+    try:
+        data = json.loads(transcript[brace_idx:])
+    except json.JSONDecodeError:
+        return {"tokens": 0, "screenshots": 0, "parse_warnings": 1}
+
+    if not isinstance(data, dict):
+        return {"tokens": 0, "screenshots": 0, "parse_warnings": 1}
+
+    usage_raw = (
+        data.get("meta", {}).get("agentMeta", {}).get("usage")
+        if isinstance(data.get("meta"), dict)
+        and isinstance(data["meta"].get("agentMeta"), dict)
+        else None
+    )
+    if not isinstance(usage_raw, dict):
+        parse_warnings += 1
+    else:
+        try:
+            usage = _Usage.model_validate(usage_raw, strict=True)
+        except ValidationError:
+            parse_warnings += 1
+        else:
+            tokens = usage.input + usage.output
 
     return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
@@ -109,7 +87,7 @@ def _parse_metrics(transcript: str) -> dict[str, int]:
 class OpenClawRunner:
     name = "openclaw"
 
-    def __init__(self, openclaw_bin: str = "openclaw"):
+    def __init__(self, openclaw_bin: str = "openclaw", agent_id: str = "main"):
         # Resolve to an absolute path at init time. This way, BASELINE-mode
         # PATH-stripping (which removes dirs containing agent-desktop) doesn't
         # also break openclaw when both binaries live in the same directory.
@@ -120,6 +98,9 @@ class OpenClawRunner:
         else:
             self._bin = shutil.which(openclaw_bin)
         self._requested_bin = openclaw_bin
+        # OpenClaw 2026.4.9 requires --agent / --to / --session-id; "main" is
+        # the user's default agent id and matches typical local installs.
+        self._agent_id = agent_id
 
     def run(self, scenario: Scenario, mode: Mode) -> RunResult:
         started = now_iso()
@@ -140,14 +121,23 @@ class OpenClawRunner:
 
         try:
             proc = subprocess.run(
-                [self._bin, "agent", "--local", "--message", scenario.prompt, "--json"],
+                [
+                    self._bin, "agent",
+                    "--agent", self._agent_id,
+                    "--local",
+                    "--message", scenario.prompt,
+                    "--json",
+                ],
                 env=env,
                 capture_output=True,
                 text=True,
                 timeout=scenario.timeout_seconds,
                 check=False,
             )
-            transcript = proc.stdout
+            # OpenClaw 2026.4.9 writes its JSON to STDERR (after a banner line).
+            # Concatenate both streams so a future shift to stdout doesn't regress
+            # token accounting.
+            transcript = (proc.stderr or "") + (proc.stdout or "")
             error = proc.stderr if proc.returncode != 0 else None
         except subprocess.TimeoutExpired:
             return RunResult(

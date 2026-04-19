@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -8,48 +9,74 @@ from agent_desktop_evals.runner_base import Mode
 from agent_desktop_evals.runners.openclaw import OpenClawRunner, _parse_metrics
 from agent_desktop_evals.scenario import Scenario
 
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
+SMOKE_FIXTURE = FIXTURE_DIR / "openclaw-smoke-output.txt"
+
 # --- _parse_metrics tests ---
 
 
-def test_parse_metrics_extracts_token_and_screenshot_counts():
-    transcript = '''
-    {"event": "turn_complete", "input_tokens": 1200, "output_tokens": 340}
-    {"event": "tool_call", "tool": "screenshot", "result_bytes": 48000}
-    {"event": "tool_call", "tool": "screenshot", "result_bytes": 51200}
-    {"event": "turn_complete", "input_tokens": 1800, "output_tokens": 220}
-    '''
-    metrics = _parse_metrics(transcript)
-    assert metrics["tokens"] == 1200 + 340 + 1800 + 220
-    assert metrics["screenshots"] == 2
+def test_parse_metrics_from_real_openclaw_output():
+    """Validate against captured real OpenClaw 2026.4.9 output (smoke test).
+
+    Ground truth: tests/fixtures/openclaw-smoke-output.txt is a real run of
+    `openclaw agent --agent main --local --message "Reply with just the word OK" --json`
+    captured from stderr. Token counts are at meta.agentMeta.usage.{input,output}
+    in that fixture. Sum is 114 + 5 = 119.
+    """
+    content = SMOKE_FIXTURE.read_text()
+    result = _parse_metrics(content)
+    assert result["tokens"] == 119, f"got {result}"
+    assert result["screenshots"] == 0
+    assert result["parse_warnings"] == 0
 
 
 def test_parse_metrics_handles_empty_transcript():
+    """Empty input is valid (no JSON object found) and must not warn — zeros, no noise."""
     metrics = _parse_metrics("")
     assert metrics["tokens"] == 0
     assert metrics["screenshots"] == 0
     assert metrics["parse_warnings"] == 0
 
 
-def test_parse_metrics_ignores_unstructured_lines():
-    transcript = '''
-    Welcome to OpenClaw
-    {"event": "turn_complete", "input_tokens": 100, "output_tokens": 50}
-    Some warning logged here
-    '''
-    assert _parse_metrics(transcript)["tokens"] == 150
-
-
-def test_parse_metrics_tolerates_null_token_fields():
-    """A null token value must degrade to zero, not raise — plan-level promise."""
-    transcript = '{"event": "turn_complete", "input_tokens": null, "output_tokens": 50}'
+def test_parse_metrics_skips_banner_before_json():
+    """OpenClaw emits a non-JSON banner line before the JSON object on stderr; parser must
+    locate the first `{` and parse from there, ignoring preceding text."""
+    transcript = (
+        "[plugins] plugins.allow is empty; some chatter here\n"
+        '{"meta": {"agentMeta": {"usage": {"input": 100, "output": 50}}}}'
+    )
     metrics = _parse_metrics(transcript)
-    assert metrics["tokens"] == 50
+    assert metrics["tokens"] == 150
+    assert metrics["parse_warnings"] == 0
+
+
+def test_parse_metrics_warns_on_unparseable_json():
+    """If everything after the first `{` fails to parse, return zeros and warn."""
+    transcript = "banner line\n{not valid json at all"
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 0
     assert metrics["screenshots"] == 0
+    assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_warns_when_usage_missing():
+    """A JSON object without meta.agentMeta.usage gets zeros + a parse warning, not a crash."""
+    transcript = '{"some_other": "shape"}'
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_no_brace_in_input():
+    """Input with no `{` at all is empty-equivalent: zeros, no warnings."""
+    metrics = _parse_metrics("just some banner output\n[plugins] etc")
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] == 0
 
 
 def test_parse_metrics_rejects_negative_tokens():
-    """Negative token counts are nonsensical; reject the event and warn."""
-    transcript = '{"event": "turn_complete", "input_tokens": -100, "output_tokens": 50}'
+    """Negative token counts are nonsensical; reject and warn."""
+    transcript = '{"meta": {"agentMeta": {"usage": {"input": -100, "output": 50}}}}'
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 1
@@ -57,7 +84,7 @@ def test_parse_metrics_rejects_negative_tokens():
 
 def test_parse_metrics_rejects_stringified_ints():
     """Token fields must be ints, not strings — silent coercion hides upstream bugs."""
-    transcript = '{"event": "turn_complete", "input_tokens": "100", "output_tokens": 50}'
+    transcript = '{"meta": {"agentMeta": {"usage": {"input": "100", "output": 50}}}}'
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 1
@@ -65,28 +92,10 @@ def test_parse_metrics_rejects_stringified_ints():
 
 def test_parse_metrics_rejects_floats():
     """Token fields must be ints, not floats — int(100.5) silently truncates to 100."""
-    transcript = '{"event": "turn_complete", "input_tokens": 100.5, "output_tokens": 50}'
+    transcript = '{"meta": {"agentMeta": {"usage": {"input": 100.5, "output": 50}}}}'
     metrics = _parse_metrics(transcript)
     assert metrics["tokens"] == 0
     assert metrics["parse_warnings"] == 1
-
-
-def test_parse_metrics_handles_pretty_printed_json():
-    """Multi-line indented JSON should either parse correctly or surface a parse_warning,
-    not silently drop the event."""
-    transcript = (
-        "{\n"
-        '  "event": "turn_complete",\n'
-        '  "input_tokens": 100,\n'
-        '  "output_tokens": 50\n'
-        "}"
-    )
-    metrics = _parse_metrics(transcript)
-    # Either tokens parse correctly (preferred), or the event is detected and
-    # a parse_warning is recorded — but the event must not be silently lost.
-    assert metrics["tokens"] == 150 or metrics["parse_warnings"] >= 1, (
-        f"pretty-printed JSON silently dropped: {metrics}"
-    )
 
 
 # --- _strip_agent_desktop tests ---
@@ -155,12 +164,18 @@ def _agent_mock(stdout: str = "", returncode: int = 0, stderr: str = "") -> Magi
     return MagicMock(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _stderr_blob(input_tokens: int, output_tokens: int) -> str:
+    """Build a stderr blob shaped like the real OpenClaw output."""
+    body = json.dumps(
+        {"meta": {"agentMeta": {"usage": {"input": input_tokens, "output": output_tokens}}}}
+    )
+    return f"[plugins] banner line goes here\n{body}\n"
+
+
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_happy_path(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """Agent succeeds AND check_state passes → success=True."""
-    agent = _agent_mock(
-        stdout='{"event": "turn_complete", "input_tokens": 500, "output_tokens": 100}\n'
-    )
+    agent = _agent_mock(stdout="", stderr=_stderr_blob(500, 100))
     check = _agent_mock(returncode=0)
     mock_run.side_effect = [agent, check]
 
@@ -183,9 +198,7 @@ def test_openclaw_runner_check_failure_means_success_false(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
     """Agent succeeds but check_state returns non-expected exit → success=False."""
-    agent = _agent_mock(
-        stdout='{"event": "turn_complete", "input_tokens": 50, "output_tokens": 10}'
-    )
+    agent = _agent_mock(stdout="", stderr=_stderr_blob(50, 10))
     check = _agent_mock(returncode=1)  # scenario expects 0
     mock_run.side_effect = [agent, check]
 
@@ -317,7 +330,7 @@ def test_baseline_mode_still_finds_openclaw_when_co_located(
 def test_openclaw_runner_uses_agent_subcommand(
     mock_run, scenario_dir: Path, fake_openclaw_on_path
 ):
-    """Runner must invoke `openclaw agent --local --message <prompt> --json`,
+    """Runner must invoke `openclaw agent --agent <id> --local --message <prompt> --json`,
     not the nonexistent `chat --print --json`."""
     mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
     OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
@@ -331,6 +344,69 @@ def test_openclaw_runner_uses_agent_subcommand(
     # Old wrong invocation should be absent
     assert "chat" not in agent_call_args
     assert "--print" not in agent_call_args
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_passes_agent_flag_default_main(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """OpenClaw bails without --agent; runner must default to 'main' (the user's default agent)."""
+    mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
+    OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    agent_args = mock_run.call_args_list[0].args[0]
+    assert "--agent" in agent_args, f"missing --agent flag: {agent_args!r}"
+    # --agent must be immediately followed by the agent id
+    assert agent_args[agent_args.index("--agent") + 1] == "main"
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_agent_id_is_configurable(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """The --agent value must be configurable via constructor for non-default agents."""
+    mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
+    OpenClawRunner(agent_id="custom-agent").run(
+        Scenario.load(scenario_dir), mode=Mode.AUGMENTED
+    )
+    agent_args = mock_run.call_args_list[0].args[0]
+    assert agent_args[agent_args.index("--agent") + 1] == "custom-agent"
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_parses_stderr_not_stdout(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """OpenClaw emits its JSON on STDERR, not stdout. Runner must parse from stderr.
+
+    Regression: previous implementation read proc.stdout, which is empty for openclaw,
+    causing tokens to silently be 0 on every real run.
+    """
+    fixture = SMOKE_FIXTURE.read_text()
+    agent_call = MagicMock(returncode=0, stdout="", stderr=fixture)
+    check_call = MagicMock(returncode=0)
+    mock_run.side_effect = [agent_call, check_call]
+    result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.tokens > 0, (
+        f"expected tokens > 0 from real fixture, got {result.tokens}"
+    )
+    assert result.tokens == 119  # 114 input + 5 output from the fixture
+    assert result.success is True
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_falls_back_to_stdout_if_stderr_empty(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """If openclaw ever changes which stream it emits on, parsing should not regress.
+
+    The runner combines stdout+stderr through _parse_metrics so the metrics still
+    surface either way."""
+    body = _stderr_blob(200, 50)
+    agent_call = MagicMock(returncode=0, stdout=body, stderr="")
+    check_call = MagicMock(returncode=0)
+    mock_run.side_effect = [agent_call, check_call]
+    result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.tokens == 250
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
@@ -352,9 +428,7 @@ def test_openclaw_runner_nonzero_agent_exit_forces_failure_even_if_check_passes(
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """If the check_state subprocess times out, surface error mentioning check_state timeout."""
-    agent = _agent_mock(
-        stdout='{"event": "turn_complete", "input_tokens": 100, "output_tokens": 50}'
-    )
+    agent = _agent_mock(stdout="", stderr=_stderr_blob(100, 50))
     mock_run.side_effect = [
         agent,
         subprocess.TimeoutExpired(cmd="bash", timeout=30),
