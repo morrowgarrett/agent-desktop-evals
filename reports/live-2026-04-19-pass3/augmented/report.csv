@@ -1,0 +1,2 @@
+scenario_id,runner_name,mode,success,tokens,screenshots,wallclock_s,steps,started_at_iso
+a-gnome-settings-augmented,openclaw,augmented,True,157534,0,76.610,0,2026-04-19T13:32:58.625284+00:00

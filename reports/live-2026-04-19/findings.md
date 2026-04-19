@@ -33,6 +33,50 @@ This is concrete data — supersedes prior speculation. Re-run pass-2 totals: to
 
 **Hold on the augmented run** until M1.5 #2 lands so we can capture the same per-tool data in augmented mode for direct comparison.
 
+## Update 2026-04-19 08:35 — augmented re-run after M1.5 #2
+
+Augmented re-run executed (`reports/live-2026-04-19-pass3/augmented/`). Bench reported `tool_calls=exec:5,read:1` automatically (no manual jq required — the M1.5 #2 work pays off immediately). Cross-checking the session log:
+
+| # | tool | what it did |
+|---|------|-------------|
+| 1 | `read` | `~/skills/agent-desktop/SKILL.md` — discovered the local OpenClaw skill |
+| 2 | `exec` | `gnome-control-center background` — opened GUI |
+| 3 | `exec` | **`agent-desktop observe --app gnome-control-center --format json`** — actually exercised the AT-SPI path |
+| 4 | `exec` | `gsettings set` × 5 keys (mutation via dconf) |
+| 5 | `exec` | `gsettings get` × 3 (verification) |
+| 6 | `exec` | `ps + xargs kill` (cleanup) |
+
+**The augmented agent ACTUALLY used `agent-desktop observe`.** It read the skill, opened the GUI, observed the AT-SPI tree, then judged gsettings was simpler for the actual mutation and used that instead. This is exactly the design intent of the SKILL.md guidance ("Not for ... file operations — use exec").
+
+### The A/B test is cleaner than I thought
+
+The skill at `~/skills/agent-desktop/SKILL.md` (created today separately from our PR #22 work) declares `requires.bins: ["agent-desktop"]`. OpenClaw's skill discovery checks `requires.bins` against `$PATH`:
+- **Baseline**: bench strips agent-desktop dir from PATH → `requires.bins` unsatisfied → skill NOT loaded → agent only knows shell tools → goes straight to gsettings (4 exec calls, no `read`).
+- **Augmented**: PATH intact → skill loaded → agent reads SKILL.md → considers agent-desktop, observes the tree, then decides gsettings is simpler (5 exec + 1 read).
+
+So PATH manipulation implicitly toggles the agent-desktop skill availability. That's the design we want for a clean A/B. Our inlined-SKILL.md-in-augmented-prompt approach was redundant — OpenClaw's skill discovery does the work — but it was also harmless (same skill content delivered twice).
+
+### Concrete pass-3 paired comparison
+
+| metric | baseline pass-2 | augmented pass-3 |
+|--------|-----------------|------------------|
+| tokens | 145,783 | 157,534 |
+| wallclock (s) | 60.81 | 76.61 |
+| tool_calls | `exec:4` | `exec:5, read:1` |
+| success | ✓ | ✓ |
+| Background after | (changed; reset) | (changed; reset) |
+
+Augmented took +15.8s and +11.7K tokens. The cost of "go through the SKILL.md, observe the tree, then fall back to gsettings" vs "just use gsettings." For THIS scenario (CLI workaround exists), the AT-SPI observation step was wasted work — the agent didn't act on what it observed.
+
+### What the bench's tool_calls field gives us going forward
+
+Now we can characterize agent behavior in any future scenario:
+- "Did augmented mode actually call agent-desktop?" — observable via tool_calls
+- "What's the ratio of agent-desktop usage to shell exec?" — `tool_calls.get("exec", 0) vs tool_calls.get("agent-desktop:N")` (where N = subcommand counts; need a follow-up to break down exec calls by argv prefix)
+- "Was a SKILL.md actually loaded?" — observable via `read` calls of skill files
+
+This is the empirical foundation the writeup needs. Single-run still applies — we need N≥5 for variance — but the qualitative signal (agent-desktop USED but not RELIED-ON) is real and reproducible.
+
 ## What this run does NOT tell us (now narrower)
 
 - **Whether the augmented agent would behave differently.** The augmented run from pass-1 wasn't captured with transcript persistence. Need to re-run augmented after #2 (parser surfaces tool calls from session log) to compare.
