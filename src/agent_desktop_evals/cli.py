@@ -42,3 +42,8 @@ def run(scenario_path: Path, runner: str, mode: str, report_dir: Path) -> None:
     click.echo(f"{scenario.id} {runner} {mode}: "
                f"success={result.success} tokens={result.tokens} "
                f"screenshots={result.screenshots} wallclock={result.wallclock_s:.2f}s")
+    if result.parse_warnings > 0:
+        click.echo(
+            f"warning: {result.parse_warnings} transcript event(s) failed validation",
+            err=True,
+        )

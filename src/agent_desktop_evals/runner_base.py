@@ -26,6 +26,7 @@ class RunResult(BaseModel):
     transcript_path: str | None = None
     started_at_iso: str
     error: str | None = None
+    parse_warnings: int = 0
 
 
 class Runner(Protocol):

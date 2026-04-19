@@ -24,7 +24,10 @@ def test_parse_metrics_extracts_token_and_screenshot_counts():
 
 
 def test_parse_metrics_handles_empty_transcript():
-    assert _parse_metrics("") == {"tokens": 0, "screenshots": 0}
+    metrics = _parse_metrics("")
+    assert metrics["tokens"] == 0
+    assert metrics["screenshots"] == 0
+    assert metrics["parse_warnings"] == 0
 
 
 def test_parse_metrics_ignores_unstructured_lines():
@@ -39,7 +42,51 @@ def test_parse_metrics_ignores_unstructured_lines():
 def test_parse_metrics_tolerates_null_token_fields():
     """A null token value must degrade to zero, not raise — plan-level promise."""
     transcript = '{"event": "turn_complete", "input_tokens": null, "output_tokens": 50}'
-    assert _parse_metrics(transcript) == {"tokens": 50, "screenshots": 0}
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 50
+    assert metrics["screenshots"] == 0
+
+
+def test_parse_metrics_rejects_negative_tokens():
+    """Negative token counts are nonsensical; reject the event and warn."""
+    transcript = '{"event": "turn_complete", "input_tokens": -100, "output_tokens": 50}'
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_rejects_stringified_ints():
+    """Token fields must be ints, not strings — silent coercion hides upstream bugs."""
+    transcript = '{"event": "turn_complete", "input_tokens": "100", "output_tokens": 50}'
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_rejects_floats():
+    """Token fields must be ints, not floats — int(100.5) silently truncates to 100."""
+    transcript = '{"event": "turn_complete", "input_tokens": 100.5, "output_tokens": 50}'
+    metrics = _parse_metrics(transcript)
+    assert metrics["tokens"] == 0
+    assert metrics["parse_warnings"] == 1
+
+
+def test_parse_metrics_handles_pretty_printed_json():
+    """Multi-line indented JSON should either parse correctly or surface a parse_warning,
+    not silently drop the event."""
+    transcript = (
+        "{\n"
+        '  "event": "turn_complete",\n'
+        '  "input_tokens": 100,\n'
+        '  "output_tokens": 50\n'
+        "}"
+    )
+    metrics = _parse_metrics(transcript)
+    # Either tokens parse correctly (preferred), or the event is detected and
+    # a parse_warning is recorded — but the event must not be silently lost.
+    assert metrics["tokens"] == 150 or metrics["parse_warnings"] >= 1, (
+        f"pretty-printed JSON silently dropped: {metrics}"
+    )
 
 
 # --- _strip_agent_desktop tests ---

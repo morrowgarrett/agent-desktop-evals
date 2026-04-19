@@ -6,32 +6,104 @@ import shutil
 import subprocess
 import time
 from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel, NonNegativeInt, ValidationError
 
 from agent_desktop_evals.runner_base import Mode, RunResult, now_iso
 from agent_desktop_evals.scenario import Scenario
 
 
-def _parse_metrics(transcript: str) -> dict[str, int]:
-    """Sum token counts and count screenshot tool calls from a JSONL transcript.
+class _TurnComplete(BaseModel):
+    """Strict shape for a turn_complete event.
 
-    Lines that aren't valid JSON are skipped — OpenClaw mixes structured events
-    with human log lines, and we only want the structured ones.
+    Tokens must be non-negative ints; null degrades to zero (handled by
+    field-level coercion before validation). Strings, floats, negatives reject.
+    """
+
+    input_tokens: NonNegativeInt = 0
+    output_tokens: NonNegativeInt = 0
+
+
+def _coerce_null(value: Any) -> Any:
+    """Treat JSON null as 0 for token fields (pre-validation tolerance)."""
+    return 0 if value is None else value
+
+
+def _split_objects(blob: str) -> list[str]:
+    """Split a string that may contain one or more JSON objects (compact or pretty-printed)
+    into individual top-level JSON object strings using a brace-balance scan.
+
+    Skips characters outside top-level objects (so log preamble/trailing text is ignored).
+    Strings and escapes are tracked so braces inside them don't confuse the scanner.
+    """
+    out: list[str] = []
+    depth = 0
+    start = -1
+    in_str = False
+    esc = False
+    for i, ch in enumerate(blob):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    out.append(blob[start : i + 1])
+                    start = -1
+    return out
+
+
+def _parse_metrics(transcript: str) -> dict[str, int]:
+    """Sum token counts and count screenshot tool calls from a transcript.
+
+    Accepts both compact JSONL and pretty-printed multi-line JSON. Validates
+    event shapes via Pydantic; rejected events increment parse_warnings rather
+    than silently miscounting.
     """
     tokens = 0
     screenshots = 0
-    for line in transcript.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
+    parse_warnings = 0
+
+    for raw in _split_objects(transcript):
         try:
-            event = json.loads(line)
+            event = json.loads(raw)
         except json.JSONDecodeError:
+            parse_warnings += 1
             continue
-        if event.get("event") == "turn_complete":
-            tokens += int(event.get("input_tokens") or 0) + int(event.get("output_tokens") or 0)
-        if event.get("event") == "tool_call" and event.get("tool") == "screenshot":
+        if not isinstance(event, dict):
+            parse_warnings += 1
+            continue
+
+        kind = event.get("event")
+        if kind == "turn_complete":
+            payload = {
+                "input_tokens": _coerce_null(event.get("input_tokens", 0)),
+                "output_tokens": _coerce_null(event.get("output_tokens", 0)),
+            }
+            try:
+                tc = _TurnComplete.model_validate(payload, strict=True)
+            except ValidationError:
+                parse_warnings += 1
+                continue
+            tokens += tc.input_tokens + tc.output_tokens
+        elif kind == "tool_call" and event.get("tool") == "screenshot":
             screenshots += 1
-    return {"tokens": tokens, "screenshots": screenshots}
+
+    return {"tokens": tokens, "screenshots": screenshots, "parse_warnings": parse_warnings}
 
 
 class OpenClawRunner:
@@ -111,6 +183,7 @@ class OpenClawRunner:
                 tokens=metrics["tokens"], screenshots=metrics["screenshots"],
                 wallclock_s=wallclock_s, started_at_iso=started,
                 error=f"check_state timed out after {scenario.check_timeout_seconds}s",
+                parse_warnings=metrics["parse_warnings"],
             )
         success = check.returncode == scenario.expect_exit_code
 
@@ -124,6 +197,7 @@ class OpenClawRunner:
             wallclock_s=wallclock_s,
             started_at_iso=started,
             error=error,
+            parse_warnings=metrics["parse_warnings"],
         )
 
     @staticmethod

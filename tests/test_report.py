@@ -45,5 +45,17 @@ def test_render_markdown_handles_only_one_mode():
     results = [_result(mode=Mode.BASELINE)]
     md = render_markdown(results)
     assert "baseline" in md
-    # no comparison row when only one mode is present
-    assert "savings" not in md.lower() or "n/a" in md.lower()
+    # No comparison row when only one mode is present — assert the absence
+    # explicitly (the previous "X not in md or Y in md" was tautological).
+    assert "delta" not in md.lower(), md
+    assert "savings" not in md.lower(), md
+    # And the table should have exactly one data row.
+    table_lines = [
+        line for line in md.splitlines()
+        if line.startswith("| ")
+        and not line.startswith("|---")
+        and "mode" not in line.lower()  # exclude header
+    ]
+    # The header row contains the literal "mode" cell label.
+    data_rows = [line for line in table_lines if "| baseline " in line or "| augmented " in line]
+    assert len(data_rows) == 1, f"expected 1 data row, got {len(data_rows)}: {data_rows}"
