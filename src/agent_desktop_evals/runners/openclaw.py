@@ -140,7 +140,7 @@ class OpenClawRunner:
 
         try:
             proc = subprocess.run(
-                [self._bin, "chat", "--print", "--json", scenario.prompt],
+                [self._bin, "agent", "--local", "--message", scenario.prompt, "--json"],
                 env=env,
                 capture_output=True,
                 text=True,

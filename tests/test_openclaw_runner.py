@@ -283,6 +283,26 @@ def test_baseline_mode_still_finds_openclaw_when_co_located(
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_uses_agent_subcommand(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """Runner must invoke `openclaw agent --local --message <prompt> --json`,
+    not the nonexistent `chat --print --json`."""
+    mock_run.side_effect = [_agent_mock(stdout=""), _agent_mock(returncode=0)]
+    OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    agent_call_args = mock_run.call_args_list[0].args[0]
+    assert agent_call_args[1] == "agent", (
+        f"expected 'agent' subcommand, got {agent_call_args!r}"
+    )
+    assert "--local" in agent_call_args
+    assert "--message" in agent_call_args
+    assert "--json" in agent_call_args
+    # Old wrong invocation should be absent
+    assert "chat" not in agent_call_args
+    assert "--print" not in agent_call_args
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """If the check_state subprocess times out, surface error mentioning check_state timeout."""
     agent = _agent_mock(
