@@ -1,0 +1,8 @@
+id = "b-libreoffice-write"
+title = "LibreOffice Writer: type a sentence and save"
+target_app = "libreoffice"
+timeout_seconds = 240
+
+[check]
+script = "check_state.sh"
+expect_exit_code = 0
