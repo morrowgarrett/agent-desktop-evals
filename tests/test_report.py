@@ -41,6 +41,24 @@ def test_render_csv_has_header_and_rows():
     assert "augmented" in lines[2]
 
 
+def test_render_markdown_warns_on_duplicate_results():
+    """Two results with same (scenario, runner, mode) should surface a warning,
+    not silently overwrite."""
+    results = [
+        _result(tokens=100),  # scenario=a-gnome-settings, runner=openclaw, mode=BASELINE
+        _result(tokens=200),  # same key — duplicate
+    ]
+    md = render_markdown(results)
+    assert (
+        "duplicate" in md.lower()
+        or "collision" in md.lower()
+        or "warning" in md.lower()
+    ), f"expected duplicate warning in output:\n{md}"
+    # The latest values should still be in the table (200, not 100), but the
+    # collision must be flagged.
+    assert "200" in md
+
+
 def test_render_markdown_handles_only_one_mode():
     results = [_result(mode=Mode.BASELINE)]
     md = render_markdown(results)

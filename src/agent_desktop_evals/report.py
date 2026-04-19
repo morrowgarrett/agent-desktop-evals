@@ -13,8 +13,12 @@ def render_markdown(results: list[RunResult]) -> str:
         return "# No results\n"
 
     by_pair: dict[tuple[str, str], dict[Mode, RunResult]] = defaultdict(dict)
+    collisions: list[tuple[str, str, Mode]] = []
     for r in results:
-        by_pair[(r.scenario_id, r.runner_name)][r.mode] = r
+        key = (r.scenario_id, r.runner_name)
+        if r.mode in by_pair[key]:
+            collisions.append((r.scenario_id, r.runner_name, r.mode))
+        by_pair[key][r.mode] = r
 
     lines: list[str] = ["# Benchmark report", ""]
     for (scenario, runner), modes in sorted(by_pair.items()):
@@ -42,6 +46,20 @@ def render_markdown(results: list[RunResult]) -> str:
                 f"| {(b.wallclock_s - a.wallclock_s):+.2f} |"
             )
         lines.append("")
+
+    if collisions:
+        lines.append("## Duplicate result warnings")
+        lines.append("")
+        lines.append(
+            "The following (scenario, runner, mode) triples appeared more than "
+            "once. Only the LAST value is shown above; earlier values were "
+            "overwritten:"
+        )
+        lines.append("")
+        for scenario, runner, mode in collisions:
+            lines.append(f"- `{scenario}` x `{runner}` x `{mode.value}`")
+        lines.append("")
+
     return "\n".join(lines)
 
 
