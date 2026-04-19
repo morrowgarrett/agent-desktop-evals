@@ -167,6 +167,21 @@ class OpenClawRunner:
         wallclock_s = time.monotonic() - t0
         metrics = _parse_metrics(transcript)
 
+        # Even if check_state would pass, a failed agent invocation must not be
+        # reported as success: a leftover desktop state from a prior run could
+        # otherwise produce a false-positive success when the agent itself
+        # crashed or exited with an error.
+        if proc.returncode != 0:
+            stderr_msg = proc.stderr.strip()[:500] if proc.stderr else "<no stderr>"
+            return RunResult(
+                scenario_id=scenario.id, runner_name=self.name, mode=mode,
+                success=False,
+                tokens=metrics["tokens"], screenshots=metrics["screenshots"],
+                wallclock_s=wallclock_s, started_at_iso=started,
+                error=f"agent exited {proc.returncode}: {stderr_msg}",
+                parse_warnings=metrics["parse_warnings"],
+            )
+
         # Verify success via the scenario's check script.
         # check_state inherits the parent env unmodified — even in BASELINE mode,
         # the *check* must have full PATH (gsettings, dconf, etc.).

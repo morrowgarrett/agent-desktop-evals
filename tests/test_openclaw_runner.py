@@ -303,6 +303,22 @@ def test_openclaw_runner_uses_agent_subcommand(
 
 
 @patch("agent_desktop_evals.runners.openclaw.subprocess.run")
+def test_openclaw_runner_nonzero_agent_exit_forces_failure_even_if_check_passes(
+    mock_run, scenario_dir: Path, fake_openclaw_on_path
+):
+    """If the agent process fails but check_state happens to pass, success must be False."""
+    agent_failed = _agent_mock(
+        returncode=2, stderr="agent: unknown subcommand 'chat'", stdout=""
+    )
+    check_passed = _agent_mock(returncode=0)  # scenario.expect_exit_code is 0
+    mock_run.side_effect = [agent_failed, check_passed]
+    result = OpenClawRunner().run(Scenario.load(scenario_dir), mode=Mode.AUGMENTED)
+    assert result.success is False, "agent failure must override passing check"
+    assert result.error is not None
+    assert "agent" in result.error.lower()  # error should attribute the failure to agent
+
+
+@patch("agent_desktop_evals.runners.openclaw.subprocess.run")
 def test_openclaw_runner_check_timeout(mock_run, scenario_dir: Path, fake_openclaw_on_path):
     """If the check_state subprocess times out, surface error mentioning check_state timeout."""
     agent = _agent_mock(
