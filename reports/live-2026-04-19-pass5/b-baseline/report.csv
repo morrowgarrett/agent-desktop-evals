@@ -1,0 +1,2 @@
+scenario_id,runner_name,mode,success,tokens,screenshots,wallclock_s,steps,started_at_iso
+b-libreoffice-write,openclaw,baseline,True,22994,0,97.787,0,2026-04-19T14:25:38.125962+00:00
